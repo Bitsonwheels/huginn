@@ -54,6 +54,7 @@ func externalStreamingTransport() *http.Transport {
 // It is safe for concurrent use.
 type ExternalBackend struct {
 	endpoint    string       // base URL, e.g. "http://localhost:11434"
+	chatPath    string       // path appended to endpoint, e.g. "/v1/chat/completions"
 	client      *http.Client
 	model       string       // configured model name
 	keyResolver KeyResolver  // optional; resolves API key sent as Bearer token
@@ -63,6 +64,7 @@ type ExternalBackend struct {
 func NewExternalBackend(endpoint string) *ExternalBackend {
 	return &ExternalBackend{
 		endpoint: strings.TrimRight(endpoint, "/"),
+		chatPath: "/v1/chat/completions",
 		client:   &http.Client{Timeout: 0, Transport: externalStreamingTransport()},
 	}
 }
@@ -98,7 +100,7 @@ func (b *ExternalBackend) ChatCompletion(ctx context.Context, req ChatRequest) (
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		b.endpoint+"/v1/chat/completions", bytes.NewReader(body))
+		b.endpoint+b.chatPath, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}

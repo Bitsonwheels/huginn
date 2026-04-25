@@ -11,8 +11,10 @@ type ManagedBackend struct {
 
 // NewManagedBackend creates a ManagedBackend wrapping endpoint, with a shutdown hook.
 func NewManagedBackend(endpoint string, shutdownFn func(context.Context) error) *ManagedBackend {
+	ext := NewExternalBackend(endpoint)
+	ext.chatPath = "/v1/chat/completion"
 	return &ManagedBackend{
-		ExternalBackend: *NewExternalBackend(endpoint),
+		ExternalBackend: *ext,
 		shutdown:        shutdownFn,
 	}
 }
