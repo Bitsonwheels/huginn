@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { shallowMount, flushPromises } from '@vue/test-utils'
-import { nextTick } from 'vue'
+import { nextTick, ref } from 'vue'
 
 // ── Mocks (hoisted before component import) ───────────────────────────────────
 
@@ -18,8 +18,8 @@ vi.mock('vue-router', () => ({
   }),
 }))
 
-vi.mock('../../composables/useNotifications', () => {
-  const { ref } = require('vue')
+vi.mock('../../composables/useNotifications', async () => {
+  const { ref } = await vi.importActual<typeof import('vue')>('vue')
   const notifications = ref<unknown[]>([])
   const pendingCount = ref(0)
   const loading = ref(false)

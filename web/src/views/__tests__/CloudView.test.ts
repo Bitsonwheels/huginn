@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { shallowMount, flushPromises } from '@vue/test-utils'
-import { nextTick } from 'vue'
+import { nextTick, ref } from 'vue'
 
 // ── Mocks (hoisted before component import) ───────────────────────────────────
 
@@ -8,8 +8,8 @@ const mockCloudStatus = vi.fn()
 const mockCloudConnect = vi.fn()
 const mockCloudDisconnect = vi.fn()
 
-vi.mock('../../composables/useCloud', () => {
-  const { ref } = require('vue')
+vi.mock('../../composables/useCloud', async () => {
+  const { ref } = await vi.importActual<typeof import('vue')>('vue')
   const status = ref({ registered: false, connected: false })
   const loading = ref(false)
   const connecting = ref(false)

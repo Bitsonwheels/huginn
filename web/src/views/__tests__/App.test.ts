@@ -123,8 +123,8 @@ vi.mock('../../composables/useThreads', () => ({
 }))
 
 // Mock the WS — factory must be self-contained (no outer refs) due to vi.mock hoisting
-vi.mock('../../composables/useHuginnWS', () => {
-  const { ref } = require('vue')
+vi.mock('../../composables/useHuginnWS', async () => {
+  const { ref } = await vi.importActual<typeof import('vue')>('vue')
   const wsInstance = {
     connected: ref(true),
     connectionState: ref('connected'),
@@ -203,7 +203,7 @@ beforeEach(() => {
   mockDms.value = []
   mockActiveSpaceId.value = null
   mockPendingCount.value = 0
-  localStorage.clear()
+  // globalThis.localStorage?.clear()
 })
 
 afterEach(() => {

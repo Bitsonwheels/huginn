@@ -14,8 +14,8 @@ const mockGetMessages = vi.fn((id: string) => {
 const mockFormatSessionLabel = vi.fn((s: any) => s?.title || s?.id?.slice(0, 8) || '')
 const mockRenameSession = vi.fn()
 
-vi.mock('../../composables/useSessions', () => {
-  const { ref } = require('vue')
+vi.mock('../../composables/useSessions', async () => {
+  const { ref } = await vi.importActual<typeof import('vue')>('vue')
   return {
     hydrationQueueOverflowed: ref(false),
     useSessions: () => ({
@@ -96,10 +96,10 @@ const mockSpaceTimeline = {
   loadMore: vi.fn().mockResolvedValue(null),
   retryHydrate: vi.fn(),
 }
-const mockUseSpaceTimeline = vi.fn(() => mockSpaceTimeline)
+const mockUseSpaceTimeline = vi.fn((..._args: any[]) => mockSpaceTimeline)
 
 vi.mock('../../composables/useSpaceTimeline', () => ({
-  useSpaceTimeline: (...args: unknown[]) => mockUseSpaceTimeline(...args),
+  useSpaceTimeline: (...args: [any, any]) => mockUseSpaceTimeline(...args),
   clearSpaceTimeline: vi.fn(),
   wireSpaceTimelineWS: vi.fn(),
 }))
@@ -220,7 +220,7 @@ describe('ChatView', () => {
       { id: '1', role: 'user', content: 'Hello' },
       { id: '2', role: 'assistant', content: 'Hi there' },
     ]
-    const wrapper = mountChatView()
+    mountChatView()
     await flushPromises()
     // Component uses v-html for markdown rendering, check that messages are in data
     expect(mockGetMessages).toHaveBeenCalled()
@@ -485,7 +485,7 @@ describe('ChatView', () => {
     // Click on AgentBeta in the dropdown
     const agentButtons = wrapper.findAll('button').filter(b => b.text().includes('AgentBeta'))
     expect(agentButtons.length).toBeGreaterThan(0)
-    await agentButtons[0].trigger('click')
+    await agentButtons[0]!.trigger('click')
     await nextTick()
 
     // ws.send should be called with set_primary_agent
@@ -521,7 +521,7 @@ describe('ChatView', () => {
     expect(chipBtns.length).toBeGreaterThan(0)
 
     // Click the chip to expand the tool call list
-    await chipBtns[0].trigger('click')
+    await chipBtns[0]!.trigger('click')
     await nextTick()
 
     // After expanding: find the individual tool call button (renders tool name 'bash')
@@ -534,7 +534,7 @@ describe('ChatView', () => {
     expect(modal.props('open')).toBe(false)
 
     // Click the individual tool button — should open the detail modal
-    await toolCallBtns[0].trigger('click')
+    await toolCallBtns[0]!.trigger('click')
     await nextTick()
 
     // After clicking: modal should be open with the correct tool call
@@ -1276,7 +1276,7 @@ describe('ChatView — agent quick-switch (6C)', () => {
     // Click AgentTwo in the dropdown list
     const agentBtns = wrapper.findAll('button').filter(b => b.text().includes('AgentTwo'))
     expect(agentBtns.length).toBeGreaterThan(0)
-    await agentBtns[0].trigger('click')
+    await agentBtns[0]!.trigger('click')
     await nextTick()
 
     expect(mockWs.send).toHaveBeenCalledWith(
@@ -1322,7 +1322,7 @@ describe('ChatView — agent quick-switch (6C)', () => {
     // Find buttons that show only "Primary" (the dropdown items, not the trigger which may differ)
     const agentBtns = wrapper.findAll('button').filter(b => b.text().includes('Primary') && b.text().includes('gpt-4'))
     expect(agentBtns.length).toBeGreaterThan(0)
-    await agentBtns[0].trigger('click')
+    await agentBtns[0]!.trigger('click')
     await nextTick()
 
     expect(mockWs.send).toHaveBeenCalledWith(
@@ -1412,7 +1412,7 @@ describe('ChatView — message display edge cases', () => {
       { id: 'a1', role: 'assistant', content: 'hello ', streaming: true },
     ]
 
-    const wrapper = mountChatView({}, mockWs)
+    mountChatView({}, mockWs)
     await nextTick()
 
     // Simulate receiving additional tokens

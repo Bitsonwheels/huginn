@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { shallowMount, flushPromises } from '@vue/test-utils'
-import { nextTick } from 'vue'
+import { nextTick, ref } from 'vue'
 
 // ── Mocks (hoisted before component import) ───────────────────────────────────
 
@@ -45,8 +45,8 @@ vi.mock('../../composables/useApi', () => ({
   },
 }))
 
-vi.mock('../../composables/useConfig', () => {
-  const { ref } = require('vue')
+vi.mock('../../composables/useConfig', async () => {
+  const { ref } = await vi.importActual<typeof import('vue')>('vue')
   const config = ref<unknown>(null)
   const loading = ref(false)
   const externallyChanged = ref(false)
