@@ -90,6 +90,12 @@ type Server struct {
 	// Tests set this to a no-op to prevent real browser windows from opening
 	// during handleCloudConnect's background registration goroutine.
 	openBrowserFn func(string) error
+	// cloudRegisterTimeout bounds the detached background registration context
+	// used by handleCloudConnect. Zero keeps the default registrar behavior.
+	cloudRegisterTimeout time.Duration
+	// cloudRegisterPollInterval overrides registrar device-code poll cadence.
+	// Tests set this low so failed browser flows drain quickly.
+	cloudRegisterPollInterval time.Duration
 
 	tm          *threadmgr.ThreadManager         // may be nil if multi-agent not configured
 	previewGate *threadmgr.DelegationPreviewGate // may be nil if preview not configured
@@ -108,12 +114,13 @@ type Server struct {
 	runtimeMgr *runtime.Manager // may be nil if built-in llama.cpp not configured
 	modelStore *models.Store    // may be nil if built-in llama.cpp not configured
 
-	notifStore       notification.StoreInterface // nil if notification storage not configured
-	sched            *scheduler.Scheduler       // nil if scheduler not configured
+	notifStore       notification.StoreInterface         // nil if notification storage not configured
+	sched            *scheduler.Scheduler                // nil if scheduler not configured
 	workflowRunStore scheduler.WorkflowRunStoreInterface // nil if not configured
+	deliveryQueue    *scheduler.DeliveryQueue            // optional
 
 	satellite *relay.Satellite // nil if not registered with HuginnCloud
-	outbox    *relay.Outbox   // nil if outbox not wired (no store path)
+	outbox    *relay.Outbox    // nil if outbox not wired (no store path)
 
 	// relayKeys maps provider name → base64url-encoded relay_key for in-progress cloud OAuth flows.
 	// Protected by relayKeysMu.
@@ -121,6 +128,13 @@ type Server struct {
 	relayKeysMu sync.RWMutex
 
 	muninnCfgPath string // path to ~/.config/huginn/muninn.json
+
+	// version is the build-time application version, injected by main.go via
+	// SetVersion. It propagates to /api/v1/health so the frontend can surface
+	// "different version" confirmation in the UI (logo tooltip, profile
+	// popover, settings About row). Empty string falls back to "dev" so the
+	// label never renders blank, even on a plain `go build` without -ldflags.
+	version string
 
 	// vaultProberFn probes MCP vault connectivity for handleVaultTest.
 	// When nil the production implementation (agent.ProbeVaultConnectivity) is used.
@@ -153,8 +167,8 @@ type Server struct {
 	artifactStore artifactStore
 
 	// symbolStore and symbolCache back the /api/v1/symbols/* handlers.
-	symbolStore  symbolQuerier
-	symbolCache  *symbolIndexCache
+	symbolStore symbolQuerier
+	symbolCache *symbolIndexCache
 
 	// ctx is the server lifecycle context stored at Start(). Used by long-running
 	// goroutines (e.g. SpawnThread) that must outlive individual HTTP requests.
@@ -281,7 +295,7 @@ func New(
 		oauthLimiter:   newFlowRateLimiter(),
 		authLimiter:    newAuthFailLimiter(),
 		credValidators: buildCredentialValidatorRegistry(),
-		relayKeys:     make(map[string]string),
+		relayKeys:      make(map[string]string),
 
 		// Enterprise-safe rate limits (per-IP, sliding window).
 		sessionCreateLimiter: newEndpointRateLimiter(10, time.Minute),
@@ -391,7 +405,7 @@ func (s *Server) Addr() string {
 //  2. auditLog.Close()       — drain audit events to SQLite
 //  3. wsHub.stop()           — close WS connections
 //  4. http.Server.Shutdown() — stop accepting new requests
-//  (caller's cleanup fn closes db after Stop returns)
+//     (caller's cleanup fn closes db after Stop returns)
 func (s *Server) Stop(ctx context.Context) error {
 	// Flush the stats persister before the HTTP server shuts down so that
 	// in-flight cost/stats records reach SQLite while the DB is still open.
@@ -675,6 +689,23 @@ func (s *Server) SetWorkflowRunStore(store scheduler.WorkflowRunStoreInterface) 
 	s.workflowRunStore = store
 }
 
+// SetDeliveryQueue wires the durable delivery queue for API access.
+func (s *Server) SetDeliveryQueue(q *scheduler.DeliveryQueue) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.deliveryQueue = q
+}
+
+// SetVersion sets the application version string used in /api/v1/health
+// responses. main.go calls this with the build-time value baked in by
+// `-ldflags "-X main.version=..."`. Pass an empty string in tests or
+// dev builds; the health handler falls back to "dev".
+func (s *Server) SetVersion(v string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.version = v
+}
+
 // SetMuninnConfigPath sets the path to the muninn.json global config.
 func (s *Server) SetMuninnConfigPath(path string) {
 	s.mu.Lock()
@@ -873,9 +904,12 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/sessions/{id}/messages", api(s.rateLimitMiddleware(func() *endpointRateLimiter { return s.mutationLimiter }, withMaxBody(50<<10, s.handleSendMessage))))
 	mux.HandleFunc("POST /api/v1/sessions/{id}/chat/stream", api(s.handleChatStream))
 	mux.HandleFunc("GET /api/v1/agents", api(s.handleListAgents))
+	mux.HandleFunc("GET /api/v1/agents/capability-matrix", api(s.handleGetCapabilityMatrix))
+	mux.HandleFunc("POST /api/v1/agents/capability-matrix/validate", api(withMaxBody(100<<10, s.handleValidateCapabilityMatrix)))
 	mux.HandleFunc("GET /api/v1/agents/{name}", api(s.handleGetAgent))
 	mux.HandleFunc("PUT /api/v1/agents/{name}", api(withMaxBody(1<<20, s.handleUpdateAgent)))
 	mux.HandleFunc("DELETE /api/v1/agents/{name}", api(s.handleDeleteAgent))
+	mux.HandleFunc("POST /api/v1/agents/{name}/clone", api(withMaxBody(1<<20, s.handleCloneAgent)))
 	mux.HandleFunc("POST /api/v1/agents/{name}/vault/test", api(s.handleVaultTest))
 	mux.HandleFunc("GET /api/v1/agents/{name}/vault-status", api(s.handleAgentVaultHealth))
 	mux.HandleFunc("GET /api/v1/models", api(s.handleListModels))
@@ -883,12 +917,12 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/models/pull", api(s.handlePullModel))
 	mux.HandleFunc("DELETE /api/v1/models/{name}", api(s.handleDeleteOllamaModel))
 	mux.HandleFunc("GET /api/v1/runtime/status", api(s.handleRuntimeStatus))
-	mux.HandleFunc("GET /api/v1/builtin/status",      api(s.handleBuiltinStatus))
-	mux.HandleFunc("POST /api/v1/builtin/download",    api(s.handleBuiltinDownload))
-	mux.HandleFunc("GET /api/v1/builtin/models",       api(s.handleBuiltinListModels))
-	mux.HandleFunc("GET /api/v1/builtin/catalog",      api(s.handleBuiltinCatalog))
-	mux.HandleFunc("POST /api/v1/builtin/models/pull",   api(s.handleBuiltinPullModel))
-	mux.HandleFunc("POST /api/v1/builtin/activate",      api(s.handleBuiltinActivate))
+	mux.HandleFunc("GET /api/v1/builtin/status", api(s.handleBuiltinStatus))
+	mux.HandleFunc("POST /api/v1/builtin/download", api(s.handleBuiltinDownload))
+	mux.HandleFunc("GET /api/v1/builtin/models", api(s.handleBuiltinListModels))
+	mux.HandleFunc("GET /api/v1/builtin/catalog", api(s.handleBuiltinCatalog))
+	mux.HandleFunc("POST /api/v1/builtin/models/pull", api(s.handleBuiltinPullModel))
+	mux.HandleFunc("POST /api/v1/builtin/activate", api(s.handleBuiltinActivate))
 	mux.HandleFunc("DELETE /api/v1/builtin/models/{name}", api(s.handleBuiltinDeleteModel))
 	mux.HandleFunc("GET /api/v1/providers/{provider}/models", api(s.handleProviderModels))
 	mux.HandleFunc("GET /api/v1/stats", api(s.handleStats))
@@ -900,70 +934,78 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /api/v1/config", api(s.handleUpdateConfig))
 
 	// Secrets API (authenticated)
-	mux.HandleFunc("GET /api/v1/secrets",          api(s.handleGetSecrets))
-	mux.HandleFunc("PUT /api/v1/secrets/{slot}",   api(s.handleSetSecret))
+	mux.HandleFunc("GET /api/v1/secrets", api(s.handleGetSecrets))
+	mux.HandleFunc("PUT /api/v1/secrets/{slot}", api(s.handleSetSecret))
 	mux.HandleFunc("DELETE /api/v1/secrets/{slot}", api(s.handleDeleteSecret))
 
 	// Active state API (authenticated)
-	mux.HandleFunc("GET /api/v1/active-state",               api(s.handleActiveState))
-	mux.HandleFunc("POST /api/v1/active-state/restore",      api(s.handleRestoreActiveState))
+	mux.HandleFunc("GET /api/v1/active-state", api(s.handleActiveState))
+	mux.HandleFunc("POST /api/v1/active-state/restore", api(s.handleRestoreActiveState))
 	mux.HandleFunc("GET /api/v1/sessions/{id}/active-state", api(s.handleSessionActiveState))
 
 	// Artifacts API (authenticated)
-	mux.HandleFunc("GET /api/v1/sessions/{id}/artifacts",                    api(s.handleListArtifacts))
-	mux.HandleFunc("POST /api/v1/sessions/{id}/artifacts",                   api(s.handleCreateArtifact))
-	mux.HandleFunc("GET /api/v1/sessions/{id}/artifacts/{artifact_id}",      api(s.handleGetArtifact))
-	mux.HandleFunc("PUT /api/v1/sessions/{id}/artifacts/{artifact_id}",      api(s.handleUpdateArtifact))
-	mux.HandleFunc("DELETE /api/v1/sessions/{id}/artifacts/{artifact_id}",   api(s.handleDeleteArtifact))
+	mux.HandleFunc("GET /api/v1/sessions/{id}/artifacts", api(s.handleListArtifacts))
+	mux.HandleFunc("POST /api/v1/sessions/{id}/artifacts", api(s.handleCreateArtifact))
+	mux.HandleFunc("GET /api/v1/sessions/{id}/artifacts/{artifact_id}", api(s.handleGetArtifact))
+	mux.HandleFunc("PUT /api/v1/sessions/{id}/artifacts/{artifact_id}", api(s.handleUpdateArtifact))
+	mux.HandleFunc("DELETE /api/v1/sessions/{id}/artifacts/{artifact_id}", api(s.handleDeleteArtifact))
 	mux.HandleFunc("GET /api/v1/sessions/{id}/artifacts/{artifact_id}/download", api(s.handleDownloadArtifact))
-	mux.HandleFunc("POST /api/v1/artifacts",              api(s.handleWorkforceCreateArtifact))
-	mux.HandleFunc("GET /api/v1/artifacts/{id}",          api(s.handleWorkforceGetArtifact))
+	mux.HandleFunc("POST /api/v1/artifacts", api(s.handleWorkforceCreateArtifact))
+	mux.HandleFunc("GET /api/v1/artifacts/{id}", api(s.handleWorkforceGetArtifact))
 	mux.HandleFunc("PATCH /api/v1/artifacts/{id}/status", api(s.handleWorkforceUpdateArtifactStatus))
 	mux.HandleFunc("GET /api/v1/agents/{name}/artifacts", api(s.handleWorkforceListAgentArtifacts))
 
 	// Threads API — message thread and container thread queries (authenticated)
-	mux.HandleFunc("GET /api/v1/messages/{id}/thread",             api(s.handleGetMessageThread))
-	mux.HandleFunc("GET /api/v1/containers/{id}/threads",          api(s.handleGetContainerThreads))
-	mux.HandleFunc("POST /api/v1/sessions/{id}/threads",           api(s.handleCreateThread))
+	mux.HandleFunc("GET /api/v1/messages/{id}/thread", api(s.handleGetMessageThread))
+	mux.HandleFunc("GET /api/v1/containers/{id}/threads", api(s.handleGetContainerThreads))
+	mux.HandleFunc("POST /api/v1/sessions/{id}/threads", api(s.handleCreateThread))
 	mux.HandleFunc("GET /api/v1/sessions/{id}/threads/{thread_id}", api(s.handleGetThread))
 	mux.HandleFunc("POST /api/v1/sessions/{id}/threads/{thread_id}/reply", api(s.handleReplyThread))
 	mux.HandleFunc("DELETE /api/v1/sessions/{id}/threads/{thread_id}", api(s.handleCancelThread))
 	mux.HandleFunc("POST /api/v1/sessions/{id}/threads/{thread_id}/archive", api(s.handleArchiveThread))
 
 	// Delegation History API (authenticated)
-	mux.HandleFunc("GET /api/v1/sessions/{id}/delegations",                       api(s.handleListDelegations))
-	mux.HandleFunc("GET /api/v1/sessions/{id}/delegations/{delegation_id}",       api(s.handleGetDelegation))
+	mux.HandleFunc("GET /api/v1/sessions/{id}/delegations", api(s.handleListDelegations))
+	mux.HandleFunc("GET /api/v1/sessions/{id}/delegations/{delegation_id}", api(s.handleGetDelegation))
 
 	// Workstreams API (authenticated)
-	mux.HandleFunc("GET /api/v1/workstreams",                        api(s.handleListWorkstreams))
-	mux.HandleFunc("POST /api/v1/workstreams",                       api(s.handleCreateWorkstream))
-	mux.HandleFunc("GET /api/v1/workstreams/{id}",                   api(s.handleGetWorkstream))
-	mux.HandleFunc("DELETE /api/v1/workstreams/{id}",                api(s.handleDeleteWorkstream))
-	mux.HandleFunc("POST /api/v1/workstreams/{id}/sessions",         api(s.handleTagWorkstreamSession))
-	mux.HandleFunc("GET /api/v1/workstreams/{id}/sessions",          api(s.handleListWorkstreamSessions))
+	mux.HandleFunc("GET /api/v1/workstreams", api(s.handleListWorkstreams))
+	mux.HandleFunc("POST /api/v1/workstreams", api(s.handleCreateWorkstream))
+	mux.HandleFunc("GET /api/v1/workstreams/{id}", api(s.handleGetWorkstream))
+	mux.HandleFunc("DELETE /api/v1/workstreams/{id}", api(s.handleDeleteWorkstream))
+	mux.HandleFunc("POST /api/v1/workstreams/{id}/sessions", api(s.handleTagWorkstreamSession))
+	mux.HandleFunc("GET /api/v1/workstreams/{id}/sessions", api(s.handleListWorkstreamSessions))
 
 	// Workflows API
-	mux.HandleFunc("GET /api/v1/workflows",             api(s.handleListWorkflows))
-	mux.HandleFunc("POST /api/v1/workflows",            api(s.handleCreateWorkflow))
-	mux.HandleFunc("GET /api/v1/workflows/templates",   api(s.handleListWorkflowTemplates))
-	mux.HandleFunc("GET /api/v1/workflows/{id}",        api(s.handleGetWorkflow))
-	mux.HandleFunc("PUT /api/v1/workflows/{id}",        api(s.handleUpdateWorkflow))
-	mux.HandleFunc("DELETE /api/v1/workflows/{id}",     api(s.handleDeleteWorkflow))
-	mux.HandleFunc("POST /api/v1/workflows/{id}/run",    api(s.rateLimitMiddleware(func() *endpointRateLimiter { return s.workflowRunLimiter }, s.handleRunWorkflow)))
+	mux.HandleFunc("GET /api/v1/workflows", api(s.handleListWorkflows))
+	mux.HandleFunc("POST /api/v1/workflows", api(s.handleCreateWorkflow))
+	mux.HandleFunc("POST /api/v1/workflows/validate", api(s.handleValidateWorkflow))
+	mux.HandleFunc("GET /api/v1/workflows/templates", api(s.handleListWorkflowTemplates))
+	mux.HandleFunc("GET /api/v1/workflows/{id}", api(s.handleGetWorkflow))
+	mux.HandleFunc("PUT /api/v1/workflows/{id}", api(s.handleUpdateWorkflow))
+	mux.HandleFunc("DELETE /api/v1/workflows/{id}", api(s.handleDeleteWorkflow))
+	mux.HandleFunc("POST /api/v1/workflows/{id}/run", api(s.rateLimitMiddleware(func() *endpointRateLimiter { return s.workflowRunLimiter }, s.handleRunWorkflow)))
+	mux.HandleFunc("POST /api/v1/workflows/{id}/webhook", api(s.rateLimitMiddleware(func() *endpointRateLimiter { return s.workflowRunLimiter }, s.handleTriggerWebhook)))
 	mux.HandleFunc("POST /api/v1/workflows/{id}/cancel", api(s.handleCancelWorkflow))
-	mux.HandleFunc("GET /api/v1/workflows/{id}/runs",           api(s.handleListWorkflowRuns))
+	mux.HandleFunc("GET /api/v1/workflows/{id}/runs", api(s.handleListWorkflowRuns))
 	mux.HandleFunc("GET /api/v1/workflows/{id}/runs/{run_id}", api(s.handleGetWorkflowRun))
-	mux.HandleFunc("GET /api/v1/delivery-failures",      api(s.handleListDeliveryFailures))
-	mux.HandleFunc("POST /api/v1/delivery-failures/retry", api(s.handleRetryDeliveryFailure))
+	mux.HandleFunc("POST /api/v1/workflows/{id}/runs/{run_id}/replay", api(s.rateLimitMiddleware(func() *endpointRateLimiter { return s.workflowRunLimiter }, s.handleReplayWorkflowRun)))
+	mux.HandleFunc("POST /api/v1/workflows/{id}/runs/{run_id}/fork", api(s.rateLimitMiddleware(func() *endpointRateLimiter { return s.workflowRunLimiter }, s.handleForkWorkflowRun)))
+	mux.HandleFunc("GET /api/v1/workflows/{id}/runs/{run_id}/diff/{other_run_id}", api(s.handleDiffWorkflowRuns))
+	mux.HandleFunc("GET /api/v1/workflows/cron-preview", api(s.handleCronPreview))
+	mux.HandleFunc("GET /api/v1/delivery-queue", api(s.handleListDeliveryQueue))
+	mux.HandleFunc("GET /api/v1/delivery-queue/badge", api(s.handleDeliveryQueueBadge))
+	mux.HandleFunc("POST /api/v1/delivery-queue/{id}/retry", api(s.handleRetryDeliveryQueueEntry))
+	mux.HandleFunc("DELETE /api/v1/delivery-queue/{id}", api(s.handleDismissDeliveryQueueEntry))
 
 	// Notifications API
-	mux.HandleFunc("GET /api/v1/notifications",              api(s.handleListNotifications))
-	mux.HandleFunc("GET /api/v1/notifications/{id}",         api(s.handleGetNotification))
+	mux.HandleFunc("GET /api/v1/notifications", api(s.handleListNotifications))
+	mux.HandleFunc("GET /api/v1/notifications/{id}", api(s.handleGetNotification))
 	mux.HandleFunc("POST /api/v1/notifications/{id}/action", api(s.handleNotificationAction))
-	mux.HandleFunc("GET /api/v1/inbox/summary",              api(s.handleInboxSummary))
+	mux.HandleFunc("GET /api/v1/inbox/summary", api(s.handleInboxSummary))
 
 	// Code Intelligence API (authenticated)
-	mux.HandleFunc("GET /api/v1/symbols/search",          api(s.handleSymbolSearch))
+	mux.HandleFunc("GET /api/v1/symbols/search", api(s.handleSymbolSearch))
 	mux.HandleFunc("GET /api/v1/symbols/impact/{symbol}", api(s.handleSymbolImpact))
 
 	// OAuth callback (no auth — provider redirects here for local flows)
@@ -992,7 +1034,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 
 	// Generic catalog-driven handlers.  Explicit per-provider routes below take
 	// precedence over these wildcards when both are registered (Go 1.22 specificity).
-	mux.HandleFunc("POST /api/v1/credentials/{provider}",      credBody(s.handleSaveCredential))
+	mux.HandleFunc("POST /api/v1/credentials/{provider}", credBody(s.handleSaveCredential))
 	mux.HandleFunc("POST /api/v1/credentials/{provider}/test", credBody(s.handleTestCredential))
 
 	// Integrations API (authenticated)
@@ -1008,11 +1050,13 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /api/v1/cloud/connect", api(s.handleCloudDisconnect))
 
 	// MuninnDB proxy API (authenticated)
-	mux.HandleFunc("GET /api/v1/muninn/status",   api(s.handleMuninnStatus))
-	mux.HandleFunc("POST /api/v1/muninn/test",    api(s.handleMuninnTest))
+	mux.HandleFunc("GET /api/v1/muninn/status", api(s.handleMuninnStatus))
+	mux.HandleFunc("POST /api/v1/muninn/test", api(s.handleMuninnTest))
 	mux.HandleFunc("POST /api/v1/muninn/connect", api(s.handleMuninnConnect))
-	mux.HandleFunc("GET /api/v1/muninn/vaults",   api(s.handleMuninnVaultsList))
-	mux.HandleFunc("POST /api/v1/muninn/vaults",  api(s.handleMuninnVaultCreate))
+	mux.HandleFunc("GET /api/v1/muninn/vaults", api(s.handleMuninnVaultsList))
+	mux.HandleFunc("POST /api/v1/muninn/vaults", api(s.handleMuninnVaultCreate))
+	mux.HandleFunc("GET /api/v1/memory/replication-status", api(s.handleMemoryReplicationStatus))
+	mux.HandleFunc("POST /api/v1/muninn/tool", api(s.handleMuninnTool))
 
 	// Spaces API (authenticated)
 	// NOTE: route ordering matters in Go 1.22+ ServeMux.

@@ -21,10 +21,30 @@ import (
 	"github.com/scrypster/huginn/internal/agents"
 	"github.com/scrypster/huginn/internal/backend"
 	"github.com/scrypster/huginn/internal/logger"
+	"github.com/scrypster/huginn/internal/memory"
 	"github.com/scrypster/huginn/internal/session"
 	"github.com/scrypster/huginn/internal/spaces"
+	"github.com/scrypster/huginn/internal/threadmgr"
 	"github.com/scrypster/huginn/internal/workforce"
 )
+
+// agentFromDefWithVault wraps agents.FromDef and forces the resulting Agent
+// to have its effective VaultName resolved exactly the way
+// agents.BuildRegistryWithUsername does. Without this, agents whose
+// VaultName field is empty in agents.json would be returned with VaultName=""
+// — and connectAgentVault skips connecting in that case, so the orchestrator
+// loses MuninnDB access for any chat handled via resolveAgentForMessage.
+// This was the source of the "no muninn_* tool calls" regression: the
+// registry built at startup had VaultName populated, but ws.go was building
+// fresh Agents from defs and dropping it.
+func agentFromDefWithVault(def agents.AgentDef) *agents.Agent {
+	a := agents.FromDef(def)
+	if a.VaultName == "" {
+		username := memory.ResolveUsername("")
+		a.VaultName = def.ResolvedVaultName(username)
+	}
+	return a
+}
 
 // serverEpoch is a random uint64 generated at process startup. It is stamped
 // on every session-scoped WebSocket message so that clients can detect server
@@ -135,13 +155,13 @@ type WSHub struct {
 	mu         sync.RWMutex
 	broadcastC chan WSMessage
 	stopC      chan struct{}
-	stopOnce   sync.Once  // ensures stop() is idempotent
-	stopped    int32      // atomic: 1 once stop() has been called
+	stopOnce   sync.Once // ensures stop() is idempotent
+	stopped    int32     // atomic: 1 once stop() has been called
 	// seqMu guards sessionSeq. We use a separate mutex so broadcastToSession
 	// can hold the RLock on mu (for clients) while atomically incrementing the
 	// per-session sequence counter.
-	seqMu            sync.Mutex
-	sessionSeq       map[string]uint64
+	seqMu             sync.Mutex
+	sessionSeq        map[string]uint64
 	wsDroppedMessages atomic.Int64
 }
 
@@ -544,6 +564,32 @@ func payloadString(m map[string]any, key string) string {
 	return fmt.Sprintf("%v", v)
 }
 
+// logToolPermissionAudit writes denied tool-permission events to audit_log.
+// It is intentionally no-op for non-denied tool events.
+func logToolPermissionAudit(a *auditLogger, payload map[string]any) {
+	if a == nil || payload == nil || !parseBoolPayload(payload["permission_denied"]) {
+		return
+	}
+	toolName := payloadString(payload, "tool")
+	if toolName == "" {
+		toolName = "unknown_tool"
+	}
+	reasonCode := payloadString(payload, "reason_code")
+	reasonText := payloadString(payload, "reason")
+	reason := reasonText
+	if reasonCode != "" {
+		if reason != "" {
+			reason = reasonCode + ": " + reason
+		} else {
+			reason = reasonCode
+		}
+	}
+	if strings.TrimSpace(reason) == "" {
+		reason = "permission denied"
+	}
+	a.Log("tool_permission", toolName, false, reason)
+}
+
 // streamEventToWS converts a backend.StreamEvent to a WSMessage.
 func streamEventToWS(ev backend.StreamEvent, sessionID string) WSMessage {
 	// Normalize streaming text and thought events to "token" so that the
@@ -577,17 +623,17 @@ func (s *Server) resolveAgent(sessionID string) *agents.Agent {
 // server restart.
 //
 // Resolution order:
-//  1.  Session's primary agent (set via "set_primary_agent" WS message or
-//      stamped at session-creation time from the space's lead agent)
-//  1b. Channel @mention override — when the message starts with @Name and the
-//      named agent is a member of the channel space, route this message to
-//      that agent (stateless per-message, does not change session state).
-//      Only applies to KindChannel spaces; DMs are always 1:1.
-//  1c. Space lead agent — defence-in-depth for DM/channel sessions created
-//      before fix #33 or where space lookup failed at session creation.
-//      Heals existing sessions at runtime without any DB migration.
-//  2.  First agent marked IsDefault in the config
-//  3.  First agent in the config (last resort)
+//  1. Session's primary agent (set via "set_primary_agent" WS message or
+//     stamped at session-creation time from the space's lead agent)
+//     1b. Channel @mention override — when the message starts with @Name and the
+//     named agent is a member of the channel space, route this message to
+//     that agent (stateless per-message, does not change session state).
+//     Only applies to KindChannel spaces; DMs are always 1:1.
+//     1c. Space lead agent — defence-in-depth for DM/channel sessions created
+//     before fix #33 or where space lookup failed at session creation.
+//     Heals existing sessions at runtime without any DB migration.
+//  2. First agent marked IsDefault in the config
+//  3. First agent in the config (last resort)
 //
 // Returns nil only if no agents are configured or the config cannot be loaded,
 // in which case callers should fall back to Orchestrator.Chat().
@@ -610,7 +656,7 @@ func (s *Server) resolveAgentForMessage(sessionID, content string) *agents.Agent
 			if agentName := sess.PrimaryAgentID(); agentName != "" {
 				for _, def := range cfg.Agents {
 					if strings.EqualFold(def.Name, agentName) {
-						return agents.FromDef(def)
+						return agentFromDefWithVault(def)
 					}
 				}
 				// Primary agent name saved but not found in config — log and fall through.
@@ -637,7 +683,7 @@ func (s *Server) resolveAgentForMessage(sessionID, content string) *agents.Agent
 					if isMember {
 						for _, def := range cfg.Agents {
 							if strings.EqualFold(def.Name, mentioned) {
-								return agents.FromDef(def)
+								return agentFromDefWithVault(def)
 							}
 						}
 						// Mentioned agent is a space member but missing from config — log and fall through.
@@ -650,7 +696,7 @@ func (s *Server) resolveAgentForMessage(sessionID, content string) *agents.Agent
 			// there is no valid @mention or the mentioned agent is not a member).
 			for _, def := range cfg.Agents {
 				if strings.EqualFold(def.Name, sp.LeadAgent) {
-					return agents.FromDef(def)
+					return agentFromDefWithVault(def)
 				}
 			}
 			logger.Warn("resolveAgentForMessage: space lead agent not found in config",
@@ -661,12 +707,12 @@ func (s *Server) resolveAgentForMessage(sessionID, content string) *agents.Agent
 	// 2. Default agent
 	for _, def := range cfg.Agents {
 		if def.IsDefault {
-			return agents.FromDef(def)
+			return agentFromDefWithVault(def)
 		}
 	}
 
 	// 3. First agent
-	return agents.FromDef(cfg.Agents[0])
+	return agentFromDefWithVault(cfg.Agents[0])
 }
 
 // extractLeadMention returns the agent name from a leading @mention at the
@@ -738,12 +784,23 @@ func (s *Server) InjectSpaceContext(ctx context.Context, sessionID string, ag *a
 					loader = agents.LoadAgents
 				}
 				cfg, cfgErr := loader()
-				descMap := make(map[string]string)
+				cardMap := make(map[string]string)
 				if cfgErr == nil {
 					for _, def := range cfg.Agents {
-						if def.Description != "" {
-							descMap[def.Name] = def.Description
-						}
+						cardMap[def.Name] = agents.BuildCapabilityCard(agents.CapabilityCardInput{
+							Name:         def.Name,
+							SystemPrompt: def.SystemPrompt,
+							Description:  def.Description,
+							ModelID:      def.Model,
+							LocalTools:   def.LocalTools,
+							Toolbelt:     def.Toolbelt,
+							Skills:       def.Skills,
+							MemoryMode:   def.MemoryMode,
+						}, nil) // intentional: no ModelInfoFn at this call site. Tier/tools annotations
+						// are omitted from DM and channel context cards. The roster (BuildRoster)
+						// still includes tier annotations because it has the full Agent registry +
+						// infoFn. This is an acceptable gap — the lead agent sees tier info in its
+						// own session prompt via BuildRoster, which is the primary delegation path.
 					}
 				}
 				var rosters []agent.ChannelRoster
@@ -751,12 +808,12 @@ func (s *Server) InjectSpaceContext(ctx context.Context, sessionID string, ag *a
 					var members []agent.SpaceMember
 					// Include lead agent
 					members = append(members, agent.SpaceMember{
-						Name: ch.LeadAgent, Description: descMap[ch.LeadAgent],
+						Name: ch.LeadAgent, Description: cardMap[ch.LeadAgent],
 					})
 					for _, m := range ch.Members {
 						if !strings.EqualFold(m, ch.LeadAgent) {
 							members = append(members, agent.SpaceMember{
-								Name: m, Description: descMap[m],
+								Name: m, Description: cardMap[m],
 							})
 						}
 					}
@@ -784,12 +841,23 @@ func (s *Server) InjectSpaceContext(ctx context.Context, sessionID string, ag *a
 		loader = agents.LoadAgents
 	}
 	cfg, cfgErr := loader()
-	descMap := make(map[string]string)
+	cardMap := make(map[string]string)
 	if cfgErr == nil {
 		for _, def := range cfg.Agents {
-			if def.Description != "" {
-				descMap[def.Name] = def.Description
-			}
+			cardMap[def.Name] = agents.BuildCapabilityCard(agents.CapabilityCardInput{
+				Name:         def.Name,
+				SystemPrompt: def.SystemPrompt,
+				Description:  def.Description,
+				ModelID:      def.Model,
+				LocalTools:   def.LocalTools,
+				Toolbelt:     def.Toolbelt,
+				Skills:       def.Skills,
+				MemoryMode:   def.MemoryMode,
+			}, nil) // intentional: no ModelInfoFn at this call site. Tier/tools annotations
+			// are omitted from DM and channel context cards. The roster (BuildRoster)
+			// still includes tier annotations because it has the full Agent registry +
+			// infoFn. This is an acceptable gap — the lead agent sees tier info in its
+			// own session prompt via BuildRoster, which is the primary delegation path.
 		}
 	}
 
@@ -802,7 +870,7 @@ func (s *Server) InjectSpaceContext(ctx context.Context, sessionID string, ag *a
 	for _, m := range sp.Members {
 		members = append(members, agent.SpaceMember{
 			Name:        m,
-			Description: descMap[m],
+			Description: cardMap[m],
 		})
 	}
 	// Include lead agent if not already in members list.
@@ -816,13 +884,38 @@ func (s *Server) InjectSpaceContext(ctx context.Context, sessionID string, ag *a
 	if !leadInMembers {
 		members = append([]agent.SpaceMember{{
 			Name:        sp.LeadAgent,
-			Description: descMap[sp.LeadAgent],
+			Description: cardMap[sp.LeadAgent],
 		}}, members...)
 	}
 
 	block := agent.BuildSpaceContextBlock(sp.Name, sp.Kind, selfName, sp.LeadAgent, members)
 	if block != "" {
 		ctx = workforce.WithSpaceContext(ctx, block)
+	}
+
+	// Attach replication context so OnToolDone can fan out memory writes to all
+	// channel members' vaults. cfg/cfgErr are already loaded above — reuse them.
+	if cfgErr == nil && len(sp.Members) > 1 {
+		username := memory.ResolveUsername("")
+		var replMembers []workforce.ReplicationMember
+		for _, memberName := range sp.Members {
+			for _, def := range cfg.Agents {
+				if strings.EqualFold(def.Name, memberName) {
+					replMembers = append(replMembers, workforce.ReplicationMember{
+						AgentName: def.Name,
+						VaultName: def.ResolvedVaultName(username),
+					})
+					break
+				}
+			}
+		}
+		if len(replMembers) > 1 {
+			ctx = workforce.WithReplicationContext(ctx, &workforce.MemReplicationContext{
+				SpaceID:   sp.ID,
+				SpaceName: sp.Name,
+				Members:   replMembers,
+			})
+		}
 	}
 
 	// Build channel-recent summary from the last few messages.
@@ -894,6 +987,7 @@ func (s *Server) handleWSMessage(c *wsClient, msg WSMessage) {
 						tc.Args = args
 					}
 					collectedToolCalls = append(collectedToolCalls, tc)
+					logToolPermissionAudit(s.auditLog, ev.Payload)
 				}
 			}
 
@@ -910,6 +1004,10 @@ func (s *Server) handleWSMessage(c *wsClient, msg WSMessage) {
 			chatCtx := c.ctx
 			chatCtx = s.InjectSpaceContext(chatCtx, sessionID, ag)
 			chatCtx = agent.SetParentMessageID(chatCtx, userMsgID)
+			// Set calling agent so DelegateFn can record the delegation's FromAgent.
+			if ag != nil {
+				chatCtx = threadmgr.SetCallingAgent(chatCtx, ag.Name)
+			}
 
 			var err error
 			if ag != nil {

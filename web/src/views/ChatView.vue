@@ -160,7 +160,7 @@
 
           <!-- Agents chip (space context) -->
           <button v-if="activeSpace"
-            @click="rosterOpen = true"
+            @click="toggleMemberPanel()"
             class="flex items-center gap-2 px-2.5 py-1 rounded-lg text-xs transition-all duration-150 hover:bg-huginn-surface active:scale-95"
             style="border:1px solid rgba(255,255,255,0.08)"
             title="Manage agents"
@@ -184,8 +184,14 @@
             </svg>
           </button>
 
-          <!-- Agent picker dropdown (standalone session context) -->
-          <div v-else-if="agentsList.length" class="relative flex-shrink-0">
+          <!-- Memory replication chip (channel/space context only) -->
+          <!-- Uses v-if with explicit activeSpace guard; agent picker below uses !activeSpace — mutually exclusive by domain -->
+          <span v-if="replChipText && activeSpace" :class="['text-[10px] px-2 py-0.5 rounded-full', replChipClass]">
+            {{ replChipText }}
+          </span>
+
+          <!-- Agent picker dropdown (standalone session context — no activeSpace) -->
+          <div v-if="!activeSpace && agentsList.length" class="relative flex-shrink-0">
             <button
               @click="agentDropdownOpen = !agentDropdownOpen"
               class="flex items-center gap-1.5 px-2 py-1 rounded-lg text-xs transition-all duration-150 hover:bg-huginn-surface"
@@ -379,14 +385,25 @@
             </div>
 
             <!-- User message (right-aligned bubble) -->
-            <div v-else-if="msg.role === 'user'" class="flex justify-end" :class="msg.showHeader ? 'mt-4' : 'mt-1'">
+            <div v-else-if="msg.role === 'user'" class="group flex flex-col items-end" :class="msg.showHeader ? 'mt-4' : 'mt-1'">
               <div class="md-content max-w-[75%] px-4 py-3 rounded-2xl rounded-tr-sm text-sm text-huginn-text leading-relaxed break-words"
                 style="background:rgba(88,166,255,0.12);border:1px solid rgba(88,166,255,0.22)"
                 v-html="renderWithMentions(msg.content)" />
+              <p v-if="msg.id === lastSeenMessageId"
+                 class="text-[10px] text-right pr-3 -mt-1"
+                 style="color:#8b949e">
+                Seen
+              </p>
+              <MessageActions
+                class="opacity-0 group-hover:opacity-100 transition-opacity"
+                :msg="msg"
+                :agent-vault-name="''"
+                @retry="handleRetry"
+              />
             </div>
 
             <!-- Assistant message (left-aligned) -->
-            <div v-else-if="msg.role === 'assistant'" class="flex gap-3" :class="msg.showHeader ? 'mt-4' : 'mt-1'">
+            <div v-else-if="msg.role === 'assistant'" class="group flex gap-3" :class="msg.showHeader ? 'mt-4' : 'mt-1'">
               <!-- Agent avatar — visible only on first message of a run; placeholder spacer otherwise -->
               <div class="w-7 flex-shrink-0 mt-0.5">
                 <div v-if="msg.showHeader"
@@ -410,6 +427,7 @@
                   v-if="msg.showHeader && msg.agent"
                   :agent-name="msg.agent"
                   :created-at="msg.createdAt"
+                  :agent-description="agentsList.find(a => a.name === msg.agent)?.description"
                 />
                 <!-- Message text -->
                 <div v-if="msg.content" class="md-content text-sm text-huginn-text leading-relaxed break-words"
@@ -583,9 +601,25 @@
                     </div>
                   </div>
                 </div>
+              <MessageActions
+                class="mt-1 opacity-0 group-hover:opacity-100 transition-opacity"
+                :msg="msg"
+                :agent-vault-name="activeAgentVaultName"
+                @save-memory="handleSaveMemory"
+              />
               </div>
             </div>
           </template>
+
+          <!-- Thinking bubble: shown while waiting for first token (agentThinking) -->
+          <div v-if="agentThinking" class="flex items-end gap-2 px-4 py-2">
+            <div class="flex gap-1 px-3 py-2 rounded-2xl rounded-bl-sm" style="background:rgba(255,255,255,0.06)">
+              <span v-for="i in 3" :key="i"
+                class="w-1.5 h-1.5 rounded-full bg-huginn-muted/60 animate-bounce"
+                :style="`animation-delay:${(i-1)*150}ms`"
+              />
+            </div>
+          </div>
 
           <!-- Streaming thinking indicator (before first token) -->
           <div v-if="streaming && messages.at(-1)?.role !== 'assistant'" class="flex gap-3">
@@ -739,6 +773,14 @@
         @reject-artifact="threadDetail.handleRejectArtifact"
         @inject="handleThreadDetailInject"
       />
+
+      <!-- Member panel (channel view only, right side) -->
+      <ChannelMemberPanel
+        v-if="activeSpace"
+        :members="spaceMemberCards"
+        :open="memberPanelOpen"
+        @toggle="toggleMemberPanel"
+      />
       </div><!-- end flex row -->
     </template>
 
@@ -806,6 +848,7 @@
 <script setup lang="ts">
 import { ref, shallowRef, computed, nextTick, inject, watch, onMounted, onUnmounted } from 'vue'
 import type { Ref } from 'vue'
+import { useRouter } from 'vue-router'
 import { useSpaceTimeline } from '../composables/useSpaceTimeline'
 import { ChatEditor } from '../components/ChatEditor'
 import { ThreadPanel } from '../components/ThreadPanel'
@@ -814,6 +857,7 @@ import ThreadDetail from '../components/ThreadDetail.vue'
 import AgentRosterModal from '../components/AgentRosterModal.vue'
 import ToolCallModal from '../components/ToolCallModal.vue'
 import AgentMessageHeader from '../components/AgentMessageHeader.vue'
+import MessageActions from '../components/MessageActions.vue'
 import type { HuginnWS, WSMessage } from '../composables/useHuginnWS'
 import { api, apiFetch } from '../composables/useApi'
 import { useSessions, hydrationQueueOverflowed, type ToolCallRecord, type ChatMessage, type DelegatedThread } from '../composables/useSessions'
@@ -826,6 +870,10 @@ import { useMarkdownRenderer } from '../composables/useMarkdownRenderer'
 import { useChatSearch } from '../composables/useChatSearch'
 import { useUnreadTracking } from '../composables/useUnreadTracking'
 import { useChatStreaming } from '../composables/useChatStreaming'
+import { useBrowserNotifications } from '../composables/useBrowserNotifications'
+import { useReplicationStatus } from '../composables/useReplicationStatus'
+import { useChatViewHeaderAndMembers } from './chat/useChatViewHeaderAndMembers'
+import ChannelMemberPanel from '../components/ChannelMemberPanel.vue'
 
 interface Agent {
   name: string
@@ -848,7 +896,7 @@ interface Agent {
 
 const props = defineProps<{ sessionId?: string; spaceId?: string }>()
 
-// const router  = useRouter()
+const router  = useRouter()
 const wsRef   = inject<Ref<HuginnWS | null>>('ws')!
 const markSpaceSeen = inject<(spaceId: string) => void>('markSpaceSeen')
 
@@ -911,7 +959,8 @@ const wsSecondsUntilRetry = computed(() => wsRef.value?.secondsUntilRetry?.value
 function wsReconnectNow() { wsRef.value?.reconnectNow?.() }
 function reloadPage() { window.location.reload() }
 
-const { sessions, getMessages, fetchMessages, queueIfHydrating, formatSessionLabel, renameSession } = useSessions()
+const { sessions, getMessages, fetchMessages, queueIfHydrating, formatSessionLabel, renameSession,
+  getAgentThinking, setAgentThinking, getLastSeenMessageId, setLastSeenMessageId } = useSessions()
 const { activeSpace } = useSpaces()
 
 // ── Hydration overflow toast ──────────────────────────────────────────────────
@@ -939,30 +988,6 @@ const sessionSwitching = ref(false)
 
 // ── Unread tracking (extracted to useUnreadTracking) ─────────────────
 // Initialized after messagesEl + messages are declared (see below).
-
-// ── Header inline rename ─────────────────────────────────────────────
-const headerEditing   = ref(false)
-const headerEditValue = ref('')
-const headerInputEl   = ref<HTMLInputElement | null>(null)
-
-async function startHeaderEdit() {
-  const s = sessions.value.find(s => s.id === props.sessionId)
-  headerEditValue.value = s?.title ?? ''
-  headerEditing.value   = true
-  await nextTick()
-  headerInputEl.value?.focus()
-  headerInputEl.value?.select()
-}
-
-function commitHeaderEdit() {
-  if (!headerEditing.value) return
-  headerEditing.value = false
-  if (props.sessionId) renameSession(props.sessionId, headerEditValue.value.trim())
-}
-
-function cancelHeaderEdit() {
-  headerEditing.value = false
-}
 
 // ── Streaming state (extracted to useChatStreaming) ──────────────────
 const {
@@ -1105,6 +1130,21 @@ const messages = computed(() => {
   return props.sessionId ? getMessages(props.sessionId) : []
 })
 
+const agentThinking = computed(() =>
+  props.sessionId ? getAgentThinking(props.sessionId) : false
+)
+
+const lastSeenMessageId = computed(() =>
+  props.sessionId ? getLastSeenMessageId(props.sessionId) : null
+)
+
+const activeAgentVaultName = computed(() => {
+  const name = selectedAgentName.value || (activeSpace.value ? spaceAgents.value[0]?.name : '')
+  if (!name) return ''
+  const agent = agentsList.value.find(a => a.name === name)
+  return (agent?.vault_name as string) ?? ''
+})
+
 // enrichedMessages (extracted to useMessageEnrichment)
 const { enrichedMessages } = useMessageEnrichment(messages as any)
 
@@ -1123,14 +1163,38 @@ const {
   atBottom, unreadCount, onMessagesScroll, markCurrentSessionSeen, jumpToUnread,
 } = useUnreadTracking(sessionIdRef, messages as any, messagesEl)
 
-const sessionLabel = computed(() => {
-  const s = sessions.value.find(s => s.id === props.sessionId)
-  return s ? formatSessionLabel(s) : (props.sessionId?.slice(0, 8) ?? '')
-})
-
 const selectedAgent = computed(() =>
   agentsList.value.find(a => a.name === selectedAgentName.value) ?? null
 )
+
+const {
+  headerEditing,
+  headerEditValue,
+  headerInputEl,
+  startHeaderEdit,
+  commitHeaderEdit,
+  cancelHeaderEdit,
+  sessionLabel,
+  spaceAgents,
+  spaceAgentPreviews,
+  spaceMemberCards,
+  displayAgent,
+  memberPanelOpen,
+  toggleMemberPanel,
+} = useChatViewHeaderAndMembers({
+  sessions: sessions as Ref<Array<{ id: string; title?: string }>>,
+  sessionId: computed(() => props.sessionId),
+  spaceId: computed(() => props.spaceId),
+  formatSessionLabel: formatSessionLabel as (s: { id: string; title?: string }) => string,
+  renameSession,
+  activeSpace: activeSpace as Ref<{ leadAgent: string; memberAgents: string[] } | null>,
+  agentsList: agentsList as Ref<Array<{ name: string; icon?: string; model?: string; description?: string; vault_name?: string; color?: string }>>,
+  selectedAgentName,
+  threadPanelOpen,
+  selectedAgent: selectedAgent as Ref<{ name: string; icon?: string; model?: string; description?: string; vault_name?: string; color?: string } | null>,
+})
+// vue-tsc does not count template ref bindings as reads; this satisfies noUnusedLocals.
+void (headerInputEl satisfies unknown)
 
 function exportSession() {
   if (!messages.value.length) return
@@ -1152,12 +1216,6 @@ function exportSession() {
   a.click()
   URL.revokeObjectURL(url)
 }
-
-// In a space context, the display agent is the space's lead agent (for avatar, icon, etc.)
-// When not in a space, fall back to the picker's selectedAgent.
-const displayAgent = computed(() =>
-  (activeSpace.value ? spaceAgents.value[0] : null) ?? selectedAgent.value ?? null
-)
 
 const sessionThreads = computed(() =>
   props.sessionId ? getSessionThreads(props.sessionId) : []
@@ -1184,13 +1242,9 @@ const agentIconMap = computed(() => {
   return m
 })
 
-const spaceAgents = computed(() => {
-  if (!activeSpace.value) return []
-  const names = [activeSpace.value.leadAgent, ...activeSpace.value.memberAgents.filter(m => m !== activeSpace.value!.leadAgent)]
-  return names.map(n => agentsList.value.find(a => a.name === n)).filter((a): a is Agent => !!a)
-})
-
-const spaceAgentPreviews = computed(() => spaceAgents.value.slice(0, 3))
+// Replication status chip
+const spaceIdRef = computed(() => props.spaceId)
+const { chipText: replChipText, chipClass: replChipClass } = useReplicationStatus(spaceIdRef)
 
 // Auto-show panel when threads appear; auto-hide 4s after all finish (unless pinned)
 watch(activeThreadCount, (count) => {
@@ -1331,11 +1385,47 @@ async function handleEditorSend(markdown: string) {
   msgs.push({ id: `u-${Date.now()}`, role: 'user', content: markdown })
   msgs.push({ id: `h-${Date.now()}`, role: 'assistant', content: '', streaming: true, agent: selectedAgentName.value || undefined, createdAt: new Date().toISOString() })
 
+  if (props.sessionId) setAgentThinking(props.sessionId, true)
+  if (props.sessionId) setLastSeenMessageId(props.sessionId, null)
   ws.send({ type: 'chat', content: markdown, session_id: props.sessionId, run_id: runId })
   scrollToBottom()
   nextTick(() => chatEditorRef.value?.focus())
 }
 
+
+function handleRetry(content: string) {
+  if (!props.sessionId || !wsRef.value) return
+  const runId = `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`
+  currentRunId.value = runId
+  streaming.value = true
+  startStreamingWatchdog()
+  const msgs = getMessages(props.sessionId)
+  msgs.push({ id: `u-${Date.now()}`, role: 'user', content })
+  msgs.push({ id: `h-${Date.now()}`, role: 'assistant', content: '', streaming: true,
+    agent: selectedAgentName.value || undefined, createdAt: new Date().toISOString() })
+  setAgentThinking(props.sessionId, true)
+  setLastSeenMessageId(props.sessionId, null)
+  wsRef.value.send({ type: 'chat', content, session_id: props.sessionId, run_id: runId })
+  scrollToBottom()
+}
+
+async function handleSaveMemory({ vault, content }: { vault: string; content: string }) {
+  if (!vault) return
+  try {
+    await apiFetch('/api/v1/muninn/tool', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        vault,
+        tool: 'muninn_remember',
+        args: {
+          concept: content.trim().slice(0, 60),
+          content,
+        },
+      }),
+    })
+  } catch { /* silent */ }
+}
 
 function cancelThread(threadId: string) {
   const ws = wsRef.value
@@ -1372,6 +1462,8 @@ async function fetchStatus() {
   } catch { /* ignore */ }
 }
 
+const { notify } = useBrowserNotifications()
+
 // ── WS event handlers ────────────────────────────────────────────────
 // Track registered handlers so we can remove them on unmount (prevents duplicate
 // handlers accumulating across component remounts, e.g. when navigating away and back).
@@ -1391,6 +1483,13 @@ watch(wsRef, (ws) => {
     // switches (props.sessionId can change between WS registration and delivery).
     const sid = msg.session_id || props.sessionId
     if (!sid || sid !== props.sessionId) return // ignore tokens for other sessions
+    if (sid) setAgentThinking(sid, false)
+    // Set lastSeenMessageId to the last user message on first token (if not set)
+    if (sid && !getLastSeenMessageId(sid)) {
+      const msgs = getMessages(sid)
+      const lastUser = [...msgs].reverse().find(m => m.role === 'user')
+      if (lastUser) setLastSeenMessageId(sid, lastUser.id)
+    }
     startStreamingWatchdog() // reset watchdog on each token to detect true inactivity
     const apply = () => {
       // Flush buffered prefetch tool results now that the assistant message exists.
@@ -1451,6 +1550,7 @@ registerWS(ws, 'done', (msg: WSMessage) => {
     }
     clearStreamingWatchdog()
     streaming.value = false
+    if (props.sessionId) setAgentThinking(props.sessionId, false)
     // Move any still-active tool calls to the last assistant message rather than
     // just discarding them. This preserves tool calls that completed during
     // streaming but whose results haven't been attached yet (e.g. timing edge cases).
@@ -1484,12 +1584,26 @@ registerWS(ws, 'done', (msg: WSMessage) => {
     }
     scrollToBottom()
     fetchStatus()
+    // Browser notification — only fires when tab is hidden (checked inside notify())
+    if (props.sessionId) {
+      const msgs = getMessages(props.sessionId)
+      const last = msgs.at(-1)
+      const agentName = last?.agent ?? 'Agent'
+      const preview = last?.content?.slice(0, 80) ?? ''
+      notify(
+        agentName,
+        preview || 'Finished responding',
+        `session-done-${props.sessionId}`,
+        () => router.push(`/chat/${props.sessionId}`)
+      )
+    }
   })
 
 registerWS(ws, 'error', (msg: WSMessage) => {
     // Allow errors without run_id (e.g. "orchestrator not initialized" sent before any run_id is
     // established). Errors that DO carry a run_id must match the current run to avoid stale errors.
     if (msg.run_id && msg.run_id !== currentRunId.value) return
+    if (props.sessionId) setAgentThinking(props.sessionId, false)
     clearStreamingWatchdog()
     streaming.value = false
     activeToolCalls.value = []
@@ -1712,6 +1826,14 @@ registerWS(ws, 'agent_follow_up', (msg: WSMessage) => {
     }
     msgs.push(fupMsg)
     scrollToBottom()
+    if (props.sessionId) {
+      notify(
+        agentName ?? 'Agent',
+        'Has a follow-up for you',
+        `follow-up-${props.sessionId}`,
+        () => router.push(`/chat/${props.sessionId}`)
+      )
+    }
   })
 
 // follow_up_cancelled: lead agent failed to synthesize (session busy or error).

@@ -82,17 +82,43 @@ func applyToolbelt(ag *agents.Agent, reg *tools.Registry, gate *permissions.Gate
 		}
 	}
 
-	// 4. Fork the permission gate so each agent run gets isolated provider maps.
+	// 4. Always inject delegation tools when registered in the registry.
+	// Delegation tools (delegate_to_agent, list_team_status, recall_thread_result)
+	// are tagged "builtin" in main.go so agents with LocalTools:["*"] already get
+	// them via step 1. But agents with a named LocalTools list only get those
+	// explicit names — delegation is excluded, causing the LLM to never call
+	// delegate_to_agent and the loop to exit early (Bug 2 / Bug 1).
+	// reg.Get returns (nil, false) when a tool is not registered, making this
+	// a safe no-op in environments that don't register delegation tools.
+	{
+		delegationNames := []string{"delegate_to_agent", "list_team_status", "recall_thread_result"}
+		seenDelegation := make(map[string]bool, len(schemas))
+		for _, s := range schemas {
+			seenDelegation[s.Function.Name] = true
+		}
+		for _, dname := range delegationNames {
+			if !seenDelegation[dname] {
+				if dt, ok := reg.Get(dname); ok {
+					schemas = append(schemas, dt.Schema())
+				}
+			}
+		}
+	}
+
+	// 5. Fork the permission gate so each agent run gets isolated provider maps.
 	// When gate is nil (no permission gate configured), the forked gate is also nil.
 	var agentGate *permissions.Gate
 	if gate != nil {
-		// Always allow "muninndb" (vault tools) even when the agent has an explicit
-		// toolbelt. The vault schemas are already included in step 3 above; without
-		// adding "muninndb" to allowedProviders, the gate would reject every vault
-		// tool call with "permission denied" for agents that have a non-empty toolbelt.
+		// Always allow "muninndb" (vault tools) and "builtin" (delegation tools and
+		// other builtins) even when the agent has an explicit toolbelt. Without this,
+		// the gate would reject calls to delegate_to_agent (tagged "builtin") and
+		// muninn tools (tagged "muninndb") with "permission denied" for agents that
+		// have a non-empty toolbelt. The schemas are already included by steps 3 and
+		// 4 above; the gate bypass ensures those calls are also permitted at runtime.
 		allowed := agents.AllowedProviders(ag.Toolbelt)
 		if allowed != nil {
 			allowed["muninndb"] = true
+			allowed["builtin"] = true
 		}
 		agentGate = gate.Fork(
 			agents.WatchedProviders(ag.Toolbelt),
@@ -351,8 +377,8 @@ func (o *Orchestrator) Dispatch(
 	ctx context.Context,
 	input string,
 	onToken func(string),
-	onToolCall func(string, map[string]any),
-	onToolDone func(string, tools.ToolResult),
+	onToolCall func(string, string, map[string]any),
+	onToolDone func(string, string, tools.ToolResult),
 	onPermDenied func(string),
 	maxTurnsPtr *int,
 	onEvent func(backend.StreamEvent),
@@ -418,8 +444,8 @@ func (o *Orchestrator) TaskWithAgent(
 	userMsg string,
 	maxTurns int,
 	onToken func(string),
-	onToolCall func(string, map[string]any),
-	onToolDone func(string, tools.ToolResult),
+	onToolCall func(string, string, map[string]any),
+	onToolDone func(string, string, tools.ToolResult),
 	onPermDenied func(string),
 	onEvent func(backend.StreamEvent),
 ) error {
@@ -455,8 +481,21 @@ func (o *Orchestrator) TaskWithAgent(
 	if _, ok := vr.sessionReg.Get("muninn_recall"); ok {
 		systemPrompt += memoryModeInstruction(ag.MemoryMode, ag.VaultName, ag.VaultDescription)
 	}
-	// Silently pre-fetch memory orientation and inject into system prompt.
-	if memCtx := o.prefetchMemoryContext(ctx, vr.sessionReg, ag.Name, ag.VaultName, userMsg); memCtx != "" {
+	// Pre-fetch memory orientation and inject into system prompt. Surface
+	// synthetic tool events so the UI can show that memory recall happened.
+	taskPrefetchCallback := func(toolName string, args map[string]any, output string, cached bool) {
+		if cached {
+			return
+		}
+		callID := fmt.Sprintf("prefetch-%s-%d", toolName, time.Now().UnixNano())
+		if onToolCall != nil {
+			onToolCall(callID, toolName, args)
+		}
+		if onToolDone != nil {
+			onToolDone(callID, toolName, tools.ToolResult{Output: output})
+		}
+	}
+	if memCtx := o.prefetchMemoryContextWithEvents(ctx, vr.sessionReg, ag.Name, ag.VaultName, userMsg, taskPrefetchCallback); memCtx != "" {
 		systemPrompt += memCtx
 	}
 
@@ -598,6 +637,14 @@ func (o *Orchestrator) ChatWithAgent(ctx context.Context, ag *agents.Agent, user
 	recentSummaries := o.loadAgentSummaries(ctx, ag.Name)
 	systemPrompt := agents.BuildPersonaPromptWithMemory(ag, ctxText, recentSummaries)
 
+	// Per-agent skills fragment. Non-default agents (workflow steps, delegated
+	// workers) need their assigned skills appended just like the default agent
+	// does in mcp_agent_chat.go. Without this they execute with no skills,
+	// which is a major parity gap for scheduled workflows.
+	if skillsFrag := o.SkillsFragmentForAgent(ag); skillsFrag != "" {
+		systemPrompt += "\n\n" + skillsFrag
+	}
+
 	// Inject space context (channel/DM metadata) if available.
 	if spaceCtx := workforce.GetSpaceContext(ctx); spaceCtx != "" {
 		systemPrompt += "\n\n" + spaceCtx
@@ -605,6 +652,14 @@ func (o *Orchestrator) ChatWithAgent(ctx context.Context, ag *agents.Agent, user
 	// Inject channel-recent summary (channels only, not DMs).
 	if recentCtx := workforce.GetChannelRecent(ctx); recentCtx != "" {
 		systemPrompt += "\n\n" + recentCtx
+	}
+
+	// Inject per-step pre-authorised connection picks (Phase 1.4). When a
+	// workflow step declares `connections: { github: my-personal-gh, ... }`
+	// the runner places that map into ctx via WithStepConnections; surface it
+	// as a system addendum so the agent uses those account labels in tool calls.
+	if connHint := stepConnectionsAddendum(ctx); connHint != "" {
+		systemPrompt += "\n\n" + connHint
 	}
 
 	history := sess.snapshotHistory()
@@ -636,8 +691,16 @@ func (o *Orchestrator) ChatWithAgent(ctx context.Context, ag *agents.Agent, user
 			slog.Info("vault tools available", "agent", ag.Name, "session_id", sessionID, "vault", ag.VaultName)
 			msgs[0].Content += memoryModeInstruction(ag.MemoryMode, ag.VaultName, ag.VaultDescription)
 		}
-		// Silently pre-fetch memory orientation and inject into system prompt.
-		if memCtx := o.prefetchMemoryContext(ctx, vr.sessionReg, ag.Name, ag.VaultName, userMsg); memCtx != "" {
+		// Pre-fetch memory orientation and inject into system prompt. Surface
+		// synthetic tool events so the UI can show that memory recall happened.
+		chatPrefetchCallback := func(toolName string, args map[string]any, output string, cached bool) {
+			if cached || onToolEvent == nil {
+				return
+			}
+			onToolEvent("tool_call", map[string]any{"tool": toolName, "args": args})
+			onToolEvent("tool_result", map[string]any{"tool": toolName, "result": output})
+		}
+		if memCtx := o.prefetchMemoryContextWithEvents(ctx, vr.sessionReg, ag.Name, ag.VaultName, userMsg, chatPrefetchCallback); memCtx != "" {
 			msgs[0].Content += memCtx
 		}
 
@@ -681,65 +744,92 @@ func (o *Orchestrator) ChatWithAgent(ctx context.Context, ag *agents.Agent, user
 		// tool dispatches. dispatchTools spawns one goroutine per tool call, so
 		// OnToolCall/OnToolDone can fire concurrently.
 		var toolArgsMu sync.Mutex
-		// toolArgsCapture stores args keyed by tool name so OnToolDone can include
-		// them in the tool_result event. Last-write-wins when the same tool is called
-		// multiple times in one turn (a known limitation).
-		// TODO(tool-call-id): key by call ID instead of tool name to fix same-tool collision.
+		// toolArgsCapture stores args keyed by callID (the LLM-assigned tool call ID).
+		// Entries are deleted in OnToolDone to prevent unbounded growth per turn.
+		// Keying by callID (not tool name) fixes the same-tool-twice collision.
 		toolArgsCapture := make(map[string]map[string]any)
-		// toolCallIDCapture stores a correlation ID per tool name so that
-		// tool_call and tool_result events carry the same id. The frontend
-		// uses this id to match results back to the pending call chip.
-		toolCallIDCapture := make(map[string]string)
 		loopCfg := RunLoopConfig{
-			MaxTurns:      50,
-			ModelName:     ag.GetModelID(),
-			Messages:      msgs,
-			Tools:         vr.sessionReg,
-			ToolSchemas:   schemas,
-			Gate:          agentGate,
-			Backend:       agChatBackend,
-			OnToken:       onToken,
+			MaxTurns:         50,
+			ModelName:        ag.GetModelID(),
+			Messages:         msgs,
+			Tools:            vr.sessionReg,
+			ToolSchemas:      schemas,
+			Gate:             agentGate,
+			Backend:          agChatBackend,
+			OnToken:          onToken,
 			OnEvent:          onEvent,
 			VaultWarnOnce:    &sync.Once{},
 			VaultReconnector: vr.reconnector,
-			OnToolCall: func(name string, args map[string]any) {
-				callID := fmt.Sprintf("tc-%d-%s", time.Now().UnixNano(), name)
+			OnToolCall: func(callID string, name string, args map[string]any) {
 				slog.Info("tool call started", "agent", ag.Name, "tool", name, "session_id", sessionID, "call_id", callID)
 				toolArgsMu.Lock()
-				toolArgsCapture[name] = args
-				toolCallIDCapture[name] = callID
+				toolArgsCapture[callID] = args
 				toolArgsMu.Unlock()
 				if onToolEvent != nil {
 					onToolEvent("tool_call", map[string]any{"tool": name, "args": args})
 				} else if onEvent != nil {
-					// Emit full tool_call event with id+args so the frontend can show
-					// a "running…" chip with context before the result arrives.
 					onEvent(backend.StreamEvent{
 						Type:    backend.StreamToolCall,
 						Payload: map[string]any{"id": callID, "tool": name, "args": args},
 					})
 				}
 			},
-			OnToolDone: func(name string, result tools.ToolResult) {
+			OnToolDone: func(callID string, name string, result tools.ToolResult) {
 				toolArgsMu.Lock()
-				capturedArgs := toolArgsCapture[name]
-				callID := toolCallIDCapture[name]
+				capturedArgs := toolArgsCapture[callID]
+				delete(toolArgsCapture, callID)
 				toolArgsMu.Unlock()
+				permissionDenied := false
+				reasonCode := ""
+				reason := ""
+				if result.Metadata != nil {
+					if denied, ok := result.Metadata["permission_denied"].(bool); ok {
+						permissionDenied = denied
+					}
+					if rc, ok := result.Metadata["reason_code"].(string); ok {
+						reasonCode = rc
+					}
+					if rs, ok := result.Metadata["reason"].(string); ok {
+						reason = rs
+					}
+				}
+				// Replicate memory writes to other channel members' vaults.
+				if o.memoryReplicator != nil && isMemoryToolName(name) && !result.IsError {
+					if replCtx := workforce.GetReplicationContext(ctx); replCtx != nil {
+						o.memoryReplicator.Intercept(ctx, name, capturedArgs, result, ag.Name, replCtx)
+					}
+				}
 				slog.Info("tool call done", "agent", ag.Name, "tool", name, "session_id", sessionID, "call_id", callID, "success", result.Error == "")
 				if onToolEvent != nil {
-					onToolEvent("tool_result", map[string]any{"tool": name, "result": result.Output})
+					payload := map[string]any{"tool": name, "result": result.Output}
+					if result.Metadata != nil {
+						payload["metadata"] = result.Metadata
+					}
+					if permissionDenied {
+						payload["permission_denied"] = true
+						payload["reason_code"] = reasonCode
+						payload["reason"] = reason
+					}
+					onToolEvent("tool_result", payload)
 				} else if onEvent != nil {
-					// Emit full tool_result event with matching id so the frontend
-					// can attach the result to the correct pending chip.
+					payload := map[string]any{
+						"id":      callID,
+						"tool":    name,
+						"success": result.Error == "",
+						"result":  result.Output,
+						"args":    capturedArgs,
+					}
+					if result.Metadata != nil {
+						payload["metadata"] = result.Metadata
+					}
+					if permissionDenied {
+						payload["permission_denied"] = true
+						payload["reason_code"] = reasonCode
+						payload["reason"] = reason
+					}
 					onEvent(backend.StreamEvent{
-						Type: backend.StreamToolResult,
-						Payload: map[string]any{
-							"id":      callID,
-							"tool":    name,
-							"success": result.Error == "",
-							"result":  result.Output,
-							"args":    capturedArgs,
-						},
+						Type:    backend.StreamToolResult,
+						Payload: payload,
 					})
 				}
 			},

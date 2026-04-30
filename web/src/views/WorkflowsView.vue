@@ -186,6 +186,52 @@
               </div>
             </div>
 
+            <!-- Workflow advanced: retry defaults + downstream chain -->
+            <div class="border border-huginn-border/60 rounded-xl overflow-hidden">
+              <button type="button" @click="showWorkflowAdvanced = !showWorkflowAdvanced"
+                data-testid="workflow-advanced-toggle"
+                class="w-full flex items-center justify-between px-4 py-2.5 text-left text-xs font-medium text-huginn-muted hover:bg-huginn-bg/40 transition-colors">
+                <span>Workflow options (retry defaults, chain)</span>
+                <span class="text-[10px] font-mono">{{ showWorkflowAdvanced ? '▼' : '▶' }}</span>
+              </button>
+              <div v-show="showWorkflowAdvanced" class="px-4 pb-4 pt-2 space-y-4 border-t border-huginn-border/40">
+                <div class="grid grid-cols-2 gap-3">
+                  <div>
+                    <label class="block text-[10px] font-medium text-huginn-muted mb-1 uppercase tracking-wider">Default max retries</label>
+                    <input v-model.number="editForm.retry.max_retries" type="number" min="0" max="10" placeholder="0"
+                      data-testid="workflow-retry-max-input"
+                      class="w-full bg-huginn-bg border border-huginn-border rounded-lg px-3 py-1.5 text-xs text-huginn-text focus:outline-none focus:border-huginn-blue/60"/>
+                    <p class="text-[10px] text-huginn-muted/50 mt-1">Inherited by steps with max retries 0.</p>
+                  </div>
+                  <div>
+                    <label class="block text-[10px] font-medium text-huginn-muted mb-1 uppercase tracking-wider">Default retry delay</label>
+                    <input v-model="editForm.retry.delay" placeholder="e.g. 30s, 2m"
+                      data-testid="workflow-retry-delay-input"
+                      class="w-full bg-huginn-bg border border-huginn-border rounded-lg px-3 py-1.5 text-xs font-mono text-huginn-text focus:outline-none focus:border-huginn-blue/60"/>
+                  </div>
+                </div>
+                <div class="space-y-2">
+                  <label class="block text-[10px] font-medium text-huginn-muted uppercase tracking-wider">Chain — trigger another workflow when this one finishes</label>
+                  <select v-model="editForm.chain.next"
+                    data-testid="workflow-chain-next-input"
+                    class="w-full bg-huginn-bg border border-huginn-border rounded-lg px-3 py-1.5 text-xs text-huginn-text focus:outline-none focus:border-huginn-blue/60">
+                    <option value="">(none)</option>
+                    <option v-for="w in chainCandidateWorkflows" :key="w.id" :value="w.id">{{ w.name }} — {{ w.id }}</option>
+                  </select>
+                  <div class="flex flex-wrap gap-4 pt-1">
+                    <label class="flex items-center gap-2 cursor-pointer">
+                      <input type="checkbox" v-model="editForm.chain.on_success" class="rounded border-huginn-border text-huginn-blue"/>
+                      <span class="text-xs text-huginn-text">On success</span>
+                    </label>
+                    <label class="flex items-center gap-2 cursor-pointer">
+                      <input type="checkbox" v-model="editForm.chain.on_failure" class="rounded border-huginn-border text-huginn-blue"/>
+                      <span class="text-xs text-huginn-text">On failure</span>
+                    </label>
+                  </div>
+                </div>
+              </div>
+            </div>
+
             <!-- Steps section -->
             <div>
               <div class="flex items-center justify-between mb-3">
@@ -229,7 +275,8 @@
                     <div class="flex-1 min-w-0">
                       <span class="text-sm text-huginn-text truncate block">{{ step.name || `Step ${idx + 1}` }}</span>
                       <span v-if="!expandedSteps.has(idx)" class="text-xs text-huginn-muted truncate block">
-                        {{ step.agent ? `@${step.agent}` : 'No agent' }}{{ step.prompt ? ' · ' + step.prompt.slice(0, 60) + (step.prompt.length > 60 ? '…' : '') : '' }}
+                        <template v-if="isSubWorkflowStep(step)">sub:{{ step.sub_workflow }}</template>
+                        <template v-else>{{ step.agent ? `@${step.agent}` : 'No agent' }}{{ step.prompt ? ' · ' + step.prompt.slice(0, 60) + (step.prompt.length > 60 ? '…' : '') : '' }}</template>
                       </span>
                     </div>
                     <span class="text-[10px] px-1.5 py-0.5 rounded font-mono flex-shrink-0"
@@ -252,7 +299,7 @@
                           <input v-model="step.name" placeholder="e.g. Morning Standup"
                             class="w-full bg-huginn-bg border border-huginn-border rounded-lg px-3 py-1.5 text-xs text-huginn-text focus:outline-none focus:border-huginn-blue/60 transition-colors"/>
                         </div>
-                        <div>
+                        <div :class="{ 'opacity-40 pointer-events-none': isSubWorkflowStep(step) }">
                           <label class="block text-[10px] font-semibold text-huginn-muted/70 uppercase tracking-wider mb-1">Agent</label>
                           <AgentPicker v-model="step.agent!" data-testid="step-agent-input" @select:agent="onAgentSelected(idx, $event)" />
                         </div>
@@ -264,10 +311,40 @@
                             <option value="continue">Continue anyway</option>
                           </select>
                         </div>
+                        <div class="col-span-2">
+                          <label class="block text-[10px] font-medium text-huginn-muted mb-1 uppercase tracking-wider">Model override (optional)</label>
+                          <input v-model="step.model_override" :disabled="isSubWorkflowStep(step)" placeholder="e.g. claude-haiku-4"
+                            data-testid="step-model-override-input"
+                            class="w-full bg-huginn-bg border border-huginn-border rounded-lg px-3 py-1.5 text-xs font-mono text-huginn-text placeholder-huginn-muted/40 focus:outline-none focus:border-huginn-blue/60 disabled:opacity-40"/>
+                          <p class="text-[10px] text-huginn-muted/45 mt-1">Ignored when this step calls a sub-workflow.</p>
+                        </div>
+                        <div class="col-span-2">
+                          <label class="block text-[10px] font-medium text-huginn-muted mb-1 uppercase tracking-wider">When (optional)</label>
+                          <textarea v-model="step.when" rows="2" placeholder="e.g. true or run.scratch.flag via placeholders"
+                            data-testid="step-when-input"
+                            class="w-full bg-huginn-bg border border-huginn-border rounded-lg px-3 py-1.5 text-xs font-mono text-huginn-text placeholder-huginn-muted/40 focus:outline-none focus:border-huginn-blue/60 resize-y"/>
+                          <p class="text-[10px] text-huginn-muted/45 mt-1">After <code class="bg-huginn-surface px-0.5 rounded">&#123;&#123;…&#125;&#125;</code> resolve: empty, false, 0, no, off → skip this step.</p>
+                        </div>
+                        <div class="col-span-2">
+                          <label class="block text-[10px] font-medium text-huginn-muted mb-1 uppercase tracking-wider">Sub-workflow (optional)</label>
+                          <div class="flex gap-2">
+                            <input v-model="step.sub_workflow" placeholder="workflow id"
+                              data-testid="step-sub-workflow-input"
+                              class="flex-1 min-w-0 bg-huginn-bg border border-huginn-border rounded-lg px-3 py-1.5 text-xs font-mono text-huginn-text placeholder-huginn-muted/40 focus:outline-none focus:border-huginn-blue/60"/>
+                            <select
+                              class="w-40 flex-shrink-0 bg-huginn-surface border border-huginn-border rounded-lg px-2 py-1.5 text-[10px] text-huginn-text focus:outline-none focus:border-huginn-blue/50"
+                              :value="''"
+                              @change="pickSubWorkflowStepId(step, $event)">
+                              <option value="">Set from…</option>
+                              <option v-for="w in chainCandidateWorkflows" :key="'sub-'+w.id" :value="w.id">{{ w.id }}</option>
+                            </select>
+                          </div>
+                          <p class="text-[10px] text-huginn-muted/45 mt-1">Runs another workflow by id; agent and prompt below are ignored.</p>
+                        </div>
                       </div>
 
                       <!-- Agent detail card -->
-                      <div v-if="stepAgentDetails[idx]" class="col-span-2 flex flex-wrap gap-1.5 items-center p-2 rounded-lg bg-huginn-surface/50 border border-huginn-border/50">
+                      <div v-if="!isSubWorkflowStep(step) && stepAgentDetails[idx]" class="col-span-2 flex flex-wrap gap-1.5 items-center p-2 rounded-lg bg-huginn-surface/50 border border-huginn-border/50">
                         <span class="text-[10px] font-mono px-2 py-0.5 rounded bg-huginn-blue/10 text-huginn-blue/80 border border-huginn-blue/20">
                           {{ (stepAgentDetails[idx] as any).model || 'no model' }}
                         </span>
@@ -291,6 +368,7 @@
                         </span>
                       </div>
 
+                      <template v-if="!isSubWorkflowStep(step)">
                       <div>
                         <label class="block text-[10px] font-medium text-huginn-muted mb-1 uppercase tracking-wider">Prompt</label>
                         <textarea v-model="step.prompt" rows="5" placeholder="What should this agent do?"
@@ -330,6 +408,10 @@
                         <p v-else class="text-[10px] text-huginn-muted/30 italic">
                           No inputs. Use <code class="bg-huginn-surface px-1 rounded">&#123;&#123;prev.output&#125;&#125;</code> in your prompt to reference the previous step's output automatically.
                         </p>
+                      </div>
+                      </template>
+                      <div v-else class="rounded-lg border border-amber-500/25 bg-amber-500/5 px-3 py-2.5 text-xs text-amber-200/90">
+                        This step runs workflow <code class="font-mono text-amber-100">{{ step.sub_workflow }}</code> synchronously. Prompt and inputs are not used.
                       </div>
 
                       <!-- Step notification (opt-in) -->
@@ -484,25 +566,45 @@
                 </button>
               </div>
               <div class="flex-1 overflow-y-auto p-3 space-y-2" ref="eventsRef">
-                <div v-for="(ev, i) in currentRunEvents" :key="i"
-                  class="text-[11px] rounded-lg px-3 py-2 font-mono"
-                  :class="{
-                    'bg-huginn-blue/10 text-huginn-blue': ev.type === 'workflow_started',
-                    'bg-huginn-surface text-huginn-text': ev.type === 'workflow_step_complete' && ev.status === 'success',
-                    'bg-amber-500/10 text-amber-400': (ev.type === 'workflow_step_complete' && ev.status === 'failed' && isPlaceholderError(ev.error)) || ev.type === 'workflow_cancelled',
-                    'bg-red-500/10 text-red-400': ev.type === 'workflow_step_complete' && ev.status === 'failed' && !isPlaceholderError(ev.error),
-                    'bg-huginn-green/10 text-huginn-green': ev.type === 'workflow_complete',
-                    'bg-red-500/15 text-red-400': ev.type === 'workflow_failed',
-                  }">
-                  <div class="flex items-center gap-1.5">
-                    <span class="opacity-60">{{ eventIcon(ev) }}</span>
-                    <span class="truncate">{{ eventLabel(ev) }}</span>
+                <template v-for="(row, i) in displayedLiveEvents" :key="i">
+                  <button v-if="isTokenBatchRow(row)" type="button"
+                    class="w-full text-left text-[11px] rounded-lg px-3 py-2 font-mono bg-slate-600/15 text-slate-300 border border-slate-500/20 cursor-pointer select-none"
+                    @click="toggleTokenBatchExpand(i)">
+                    <div class="flex items-center gap-1.5">
+                      <span class="opacity-60">⋯</span>
+                      <span class="truncate">Model tokens · {{ row.count }} chunk(s) · {{ row.text.length }} chars</span>
+                    </div>
+                    <div v-if="expandedTokenBatchIndex === i"
+                      class="mt-1 max-h-36 overflow-y-auto text-[10px] text-slate-400/90 whitespace-pre-wrap break-words">
+                      {{ row.text }}
+                    </div>
+                  </button>
+                  <div v-else
+                    class="text-[11px] rounded-lg px-3 py-2 font-mono"
+                    :class="{
+                      'bg-huginn-blue/10 text-huginn-blue': row.type === 'workflow_started',
+                      'bg-indigo-500/10 text-indigo-300': row.type === 'workflow_step_started',
+                      'bg-huginn-surface text-huginn-text': row.type === 'workflow_step_complete' && row.status === 'success',
+                      'bg-amber-500/10 text-amber-400': (row.type === 'workflow_step_complete' && row.status === 'failed' && isPlaceholderError(row.error)) || row.type === 'workflow_cancelled',
+                      'bg-red-500/10 text-red-400': row.type === 'workflow_step_complete' && row.status === 'failed' && !isPlaceholderError(row.error),
+                      'bg-huginn-green/10 text-huginn-green': row.type === 'workflow_complete',
+                      'bg-red-500/15 text-red-400': row.type === 'workflow_failed',
+                      'bg-amber-500/12 text-amber-300': row.type === 'workflow_partial',
+                      'bg-teal-500/10 text-teal-300': row.type === 'workflow_skipped',
+                    }">
+                    <div class="flex items-center gap-1.5">
+                      <span class="opacity-60">{{ eventIcon(row) }}</span>
+                      <span class="truncate">{{ eventLabel(row) }}</span>
+                    </div>
+                    <div v-if="row.error && !isPlaceholderError(row.error)" class="mt-1 opacity-70 text-[10px] break-words">{{ row.error }}</div>
+                    <div v-if="row.error && isPlaceholderError(row.error)" class="mt-1 text-[10px] break-words text-amber-400/80">
+                      ⚠ Template placeholder not resolved — check from_step references
+                    </div>
+                    <div v-if="row.type === 'workflow_skipped' && row.when_resolved" class="mt-1 text-[10px] text-teal-200/70 break-words">
+                      when: {{ row.when_resolved }}
+                    </div>
                   </div>
-                  <div v-if="ev.error && !isPlaceholderError(ev.error)" class="mt-1 opacity-70 text-[10px] break-words">{{ ev.error }}</div>
-                  <div v-if="ev.error && isPlaceholderError(ev.error)" class="mt-1 text-[10px] break-words text-amber-400/80">
-                    ⚠ Template placeholder not resolved — check from_step references
-                  </div>
-                </div>
+                </template>
               </div>
             </div>
           </Transition>
@@ -514,15 +616,19 @@
     <Teleport to="body">
       <Transition name="overlay">
         <div v-if="showHistory" class="fixed inset-0 z-50 flex justify-end">
-          <div class="absolute inset-0 bg-black/40 backdrop-blur-sm" @click="showHistory = false"/>
+          <div class="absolute inset-0 bg-black/40 backdrop-blur-sm" @click="closeHistory()"/>
           <div class="relative w-96 bg-huginn-bg border-l border-huginn-border flex flex-col shadow-2xl">
             <div class="flex items-center justify-between px-5 py-4 border-b border-huginn-border">
               <h2 class="text-sm font-semibold text-huginn-text">Run History</h2>
-              <button @click="showHistory = false" class="text-huginn-muted hover:text-huginn-text transition-colors">
+              <button @click="closeHistory()" class="text-huginn-muted hover:text-huginn-text transition-colors">
                 <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                   <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
                 </svg>
               </button>
+            </div>
+            <div v-if="historyFeedback" class="px-4 py-2 text-[11px] border-b border-huginn-border/60"
+              :class="historyFeedback.err ? 'text-red-400 bg-red-500/8' : 'text-huginn-green bg-huginn-green/8'">
+              {{ historyFeedback.text }}
             </div>
             <div class="flex-1 overflow-y-auto p-4 space-y-3">
               <div v-if="loadingHistory" class="flex justify-center py-10">
@@ -532,7 +638,7 @@
               <div v-else v-for="run in runs" :key="run.id"
                 class="bg-huginn-surface border rounded-xl overflow-hidden transition-colors duration-150 cursor-pointer"
                 :class="expandedRunId === run.id ? 'border-huginn-blue/30' : 'border-huginn-border'"
-                @click="expandedRunId = expandedRunId === run.id ? null : run.id">
+                @click="toggleRun(run.id)">
                 <!-- Run header -->
                 <div class="flex items-center justify-between p-3">
                   <div class="flex items-center gap-2 min-w-0">
@@ -563,7 +669,7 @@
                       'bg-red-500/10 text-red-400': s.status === 'failed' && !isPlaceholderError(s.error),
                       'bg-huginn-muted/10 text-huginn-muted': s.status === 'skipped',
                     }"
-                    :title="isPlaceholderError(s.error) ? '⚠ Template placeholder not resolved — check from_step references' : s.error">
+                    :title="stepPillTitle(s)">
                     {{ s.slug || `step ${s.position}` }}
                   </div>
                 </div>
@@ -575,45 +681,236 @@
                 </div>
                 <!-- Expanded step detail -->
                 <div v-if="expandedRunId === run.id" class="border-t border-huginn-border/60 bg-huginn-bg/50">
-                  <div v-for="s in run.steps" :key="s.position"
-                    class="px-4 py-2.5 border-b border-huginn-border/40 last:border-b-0">
-                    <div class="flex items-start justify-between gap-2">
-                      <div class="flex items-center gap-2 min-w-0">
-                        <span class="text-[10px] font-mono flex-shrink-0"
-                          :class="{
-                            'text-huginn-green': s.status === 'success',
-                            'text-red-400': s.status === 'failed',
-                            'text-huginn-muted': s.status === 'skipped',
-                          }">
-                          {{ s.status === 'success' ? '✓' : s.status === 'failed' ? '✗' : '–' }}
-                        </span>
-                        <span class="text-xs text-huginn-text truncate">{{ s.slug || `Step ${s.position}` }}</span>
+                  <div class="px-4 py-2 flex flex-wrap gap-2 border-b border-huginn-border/40">
+                    <button type="button"
+                      data-testid="run-replay-btn"
+                      class="text-[10px] px-2 py-1 rounded border border-huginn-border text-huginn-text hover:border-huginn-blue/40 transition-colors"
+                      @click.stop="startReplay(run)">Replay</button>
+                    <button type="button"
+                      data-testid="run-fork-btn"
+                      class="text-[10px] px-2 py-1 rounded border border-huginn-border text-huginn-text hover:border-huginn-blue/40 transition-colors"
+                      @click.stop="openForkModal(run)">Fork…</button>
+                    <button type="button"
+                      data-testid="run-diff-btn"
+                      class="text-[10px] px-2 py-1 rounded border border-huginn-border text-huginn-text hover:border-huginn-blue/40 transition-colors"
+                      @click.stop="openDiffModal(run)">Diff vs…</button>
+                  </div>
+
+                  <!-- Tab bar -->
+                  <div class="flex gap-4 border-b border-huginn-border px-4 mb-0 text-xs">
+                    <button
+                      @click.stop="runDetailTab = 'steps'"
+                      :class="runDetailTab === 'steps'
+                        ? 'text-huginn-text border-b-2 border-huginn-blue pb-1 pt-1'
+                        : 'text-huginn-muted pb-1 pt-1'"
+                    >Steps</button>
+                    <button
+                      @click.stop="runDetailTab = 'deliveries'"
+                      :class="runDetailTab === 'deliveries'
+                        ? 'text-huginn-text border-b-2 border-huginn-blue pb-1 pt-1'
+                        : 'text-huginn-muted pb-1 pt-1'"
+                    >
+                      Deliveries
+                      <span v-if="runDeliveries.length > 0"
+                        class="ml-1 bg-red-500 text-white text-[8px] font-bold rounded-full px-1">
+                        {{ runDeliveries.length }}
+                      </span>
+                    </button>
+                  </div>
+
+                  <!-- Steps panel -->
+                  <template v-if="runDetailTab === 'steps'">
+                    <div v-for="s in run.steps" :key="s.position"
+                      class="px-4 py-2.5 border-b border-huginn-border/40 last:border-b-0">
+                      <div class="flex items-start justify-between gap-2">
+                        <div class="flex items-center gap-2 min-w-0">
+                          <span class="text-[10px] font-mono flex-shrink-0"
+                            :class="{
+                              'text-huginn-green': s.status === 'success',
+                              'text-red-400': s.status === 'failed',
+                              'text-huginn-muted': s.status === 'skipped',
+                            }">
+                            {{ s.status === 'success' ? '✓' : s.status === 'failed' ? '✗' : '–' }}
+                          </span>
+                          <span class="text-xs text-huginn-text truncate">{{ s.slug || `Step ${s.position}` }}</span>
+                        </div>
+                        <div v-if="s.session_id" class="flex items-start gap-1 flex-shrink-0 relative">
+                          <a :href="`/sessions/${s.session_id}`"
+                            @click.stop
+                            class="text-[10px] text-huginn-blue/70 hover:text-huginn-blue flex items-center gap-1 transition-colors"
+                            title="Open session">
+                            <svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                              <path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6M15 3h6v6M10 14L21 3"/>
+                            </svg>
+                            session
+                          </a>
+                          <div class="relative">
+                            <button type="button"
+                              data-testid="step-session-artifacts-btn"
+                              class="text-[10px] text-huginn-muted hover:text-huginn-text px-1 py-0.5 rounded border border-huginn-border/60"
+                              title="Artifacts produced in this session"
+                              @click.stop="toggleArtifactPopover(s.session_id!)">
+                              Artifacts
+                            </button>
+                            <div v-if="artifactPopoverSessionId === s.session_id"
+                              class="absolute right-0 z-20 mt-1 w-60 max-h-52 overflow-y-auto rounded-lg border border-huginn-border bg-huginn-surface shadow-xl p-2 text-left">
+                              <div v-if="sessionArtifactsLoading[s.session_id]" class="text-[10px] text-huginn-muted py-1">Loading…</div>
+                              <template v-else>
+                                <p v-if="!(sessionArtifactsById[s.session_id]?.length)" class="text-[10px] text-huginn-muted">No artifacts in this session.</p>
+                                <ul v-else class="space-y-1.5">
+                                  <li v-for="a in sessionArtifactsById[s.session_id]" :key="a.id" class="text-[10px] leading-snug">
+                                    <span class="text-huginn-text font-medium">{{ a.title || a.id }}</span>
+                                    <span class="text-huginn-muted/70"> · {{ a.kind }} · {{ a.status }}</span>
+                                  </li>
+                                </ul>
+                              </template>
+                            </div>
+                          </div>
+                        </div>
                       </div>
-                      <a v-if="s.session_id"
-                        :href="`/sessions/${s.session_id}`"
-                        @click.stop
-                        class="text-[10px] text-huginn-blue/70 hover:text-huginn-blue flex-shrink-0 flex items-center gap-1 transition-colors"
-                        title="Open session">
-                        <svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                          <path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6M15 3h6v6M10 14L21 3"/>
-                        </svg>
-                        session
-                      </a>
+                      <div v-if="stepMetricsLine(s)" class="mt-0.5 text-[10px] font-mono text-huginn-muted/55">
+                        {{ stepMetricsLine(s) }}
+                      </div>
+                      <div v-if="s.status === 'skipped'" class="mt-1 text-[10px] text-huginn-muted/80 break-words">
+                        {{ skipStepTooltip(s) }}
+                      </div>
+                      <div v-if="s.error" class="mt-1 text-[10px] font-mono break-words"
+                        :class="isPlaceholderError(s.error) ? 'text-amber-400/80' : 'text-red-400/80'">
+                        {{ isPlaceholderError(s.error) ? '⚠ unresolved template placeholder' : s.error }}
+                      </div>
+                      <div v-if="s.output" class="mt-1 space-y-1">
+                        <div class="text-[10px] font-mono text-huginn-muted/70 line-clamp-3 break-words">{{ s.output }}</div>
+                        <div class="flex flex-wrap gap-2">
+                          <button type="button"
+                            class="text-[10px] text-huginn-blue hover:text-huginn-blue/80 transition-colors"
+                            @click.stop="stepOutputModal = { title: `${run.id.slice(-12)} · ${s.slug || 'step ' + s.position}`, body: s.output || '' }">
+                            Expand output
+                          </button>
+                          <button type="button"
+                            class="text-[10px] text-huginn-muted hover:text-huginn-text transition-colors"
+                            @click.stop="copyStepOutput(s.output || '')">
+                            Copy full output
+                          </button>
+                        </div>
+                      </div>
                     </div>
-                    <div v-if="s.error" class="mt-1 text-[10px] font-mono break-words"
-                      :class="isPlaceholderError(s.error) ? 'text-amber-400/80' : 'text-red-400/80'">
-                      {{ isPlaceholderError(s.error) ? '⚠ unresolved template placeholder' : s.error }}
+                    <div v-if="run.error" class="px-4 py-2.5 text-[10px] font-mono text-red-400/80 break-words">
+                      {{ run.error }}
                     </div>
-                    <div v-if="s.output" class="mt-1 text-[10px] font-mono text-huginn-muted/70 line-clamp-3 break-words">
-                      {{ s.output }}
+                  </template>
+
+                  <!-- Deliveries panel -->
+                  <div v-else class="flex flex-col gap-2 px-4 py-3">
+                    <div v-if="runDeliveries.length === 0" class="text-huginn-muted text-xs py-4 text-center">
+                      All deliveries successful
+                    </div>
+                    <div v-for="entry in runDeliveries" :key="entry.id"
+                      class="bg-huginn-surface rounded-lg p-3 border border-huginn-border text-xs">
+                      <div class="flex items-center justify-between gap-2">
+                        <div class="flex items-center gap-2 min-w-0">
+                          <span :class="entry.channel === 'webhook' ? 'text-huginn-blue' : 'text-purple-400'">
+                            {{ entry.channel }}
+                          </span>
+                          <span class="text-huginn-muted truncate">{{ entry.endpoint }}</span>
+                        </div>
+                        <div class="flex items-center gap-2 flex-shrink-0">
+                          <span class="text-red-400">failed after {{ entry.attempt_count }} attempts</span>
+                          <button @click="retryEntry(entry.id)"
+                            class="px-2 py-0.5 bg-huginn-blue/20 text-huginn-blue rounded hover:bg-huginn-blue/30 text-xs">
+                            Retry
+                          </button>
+                          <button @click="dismissEntry(entry.id)"
+                            class="px-2 py-0.5 bg-huginn-surface text-huginn-muted rounded hover:text-huginn-text text-xs">
+                            Dismiss
+                          </button>
+                        </div>
+                      </div>
+                      <div v-if="entry.last_error" class="text-huginn-muted mt-1 truncate">
+                        {{ entry.last_error }}
+                      </div>
                     </div>
                   </div>
-                  <div v-if="run.error" class="px-4 py-2.5 text-[10px] font-mono text-red-400/80 break-words">
-                    {{ run.error }}
-                  </div>
+
                 </div>
               </div>
             </div>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
+
+    <Teleport to="body">
+      <Transition name="overlay">
+        <div v-if="stepOutputModal" class="fixed inset-0 z-[60] flex items-center justify-center p-4">
+          <div class="absolute inset-0 bg-black/50 backdrop-blur-sm" @click="stepOutputModal = null"/>
+          <div class="relative w-full max-w-3xl max-h-[85vh] flex flex-col bg-huginn-bg border border-huginn-border rounded-xl shadow-2xl">
+            <div class="flex items-center justify-between px-4 py-3 border-b border-huginn-border flex-shrink-0">
+              <h3 class="text-xs font-medium text-huginn-text truncate pr-2">{{ stepOutputModal.title }}</h3>
+              <div class="flex items-center gap-2 flex-shrink-0">
+                <button type="button"
+                  class="text-[10px] text-huginn-blue hover:text-huginn-blue/80"
+                  @click="copyStepOutput(stepOutputModal.body)">Copy</button>
+                <button type="button" class="text-huginn-muted hover:text-huginn-text p-1" @click="stepOutputModal = null" aria-label="Close">
+                  <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+                  </svg>
+                </button>
+              </div>
+            </div>
+            <pre class="flex-1 overflow-y-auto p-4 text-[11px] font-mono text-huginn-text whitespace-pre-wrap break-words">{{ stepOutputModal.body }}</pre>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
+
+    <Teleport to="body">
+      <Transition name="overlay">
+        <div v-if="showForkModal && forkTargetRun" class="fixed inset-0 z-[60] flex items-center justify-center p-4">
+          <div class="absolute inset-0 bg-black/50 backdrop-blur-sm" @click="showForkModal = false"/>
+          <div class="relative w-full max-w-md bg-huginn-bg border border-huginn-border rounded-xl shadow-2xl p-5 space-y-3">
+            <h3 class="text-sm font-semibold text-huginn-text">Fork run</h3>
+            <p class="text-[11px] text-huginn-muted">Optional JSON object of input overrides (merged with the prior run's trigger inputs).</p>
+            <textarea v-model="forkInputsJson" rows="4" placeholder='{ "key": "value" }'
+              data-testid="fork-inputs-json"
+              class="w-full bg-huginn-surface border border-huginn-border rounded-lg px-3 py-2 text-[11px] font-mono text-huginn-text focus:outline-none focus:border-huginn-blue/50"/>
+            <label class="flex items-center gap-2 cursor-pointer text-xs text-huginn-text">
+              <input type="checkbox" v-model="forkUseLive" data-testid="fork-use-live-checkbox" class="rounded border-huginn-border text-huginn-blue"/>
+              Use live workflow definition (not snapshot)
+            </label>
+            <div class="flex justify-end gap-2 pt-2">
+              <button type="button" class="text-xs text-huginn-muted hover:text-huginn-text px-3 py-1.5" @click="showForkModal = false">Cancel</button>
+              <button type="button" data-testid="fork-submit-btn"
+                class="text-xs px-3 py-1.5 rounded-lg bg-huginn-blue text-white hover:bg-huginn-blue/90 disabled:opacity-50"
+                :disabled="forkSubmitting" @click="submitFork">{{ forkSubmitting ? 'Starting…' : 'Fork run' }}</button>
+            </div>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
+
+    <Teleport to="body">
+      <Transition name="overlay">
+        <div v-if="showDiffModal && diffBaseRun" class="fixed inset-0 z-[60] flex items-center justify-center p-4">
+          <div class="absolute inset-0 bg-black/50 backdrop-blur-sm" @click="showDiffModal = false"/>
+          <div class="relative w-full max-w-2xl max-h-[90vh] flex flex-col bg-huginn-bg border border-huginn-border rounded-xl shadow-2xl p-5 gap-3">
+            <h3 class="text-sm font-semibold text-huginn-text">Compare runs</h3>
+            <p class="text-[11px] text-huginn-muted truncate">Base: {{ diffBaseRun.id.slice(-12) }} ({{ diffBaseRun.status }})</p>
+            <div class="flex flex-wrap items-end gap-2">
+              <label class="flex-1 min-w-[12rem] text-[10px] text-huginn-muted uppercase tracking-wider">Other run</label>
+              <select v-model="diffOtherRunId" data-testid="diff-other-run-select"
+                class="flex-1 min-w-[12rem] bg-huginn-surface border border-huginn-border rounded-lg px-2 py-1.5 text-xs font-mono text-huginn-text">
+                <option v-for="r in runs.filter(x => x.id !== diffBaseRun!.id)" :key="r.id" :value="r.id">
+                  {{ r.id.slice(-12) }} — {{ r.status }}
+                </option>
+              </select>
+              <button type="button" data-testid="diff-compare-btn"
+                class="text-xs px-3 py-1.5 rounded-lg bg-huginn-blue text-white hover:bg-huginn-blue/90 disabled:opacity-50"
+                :disabled="diffLoading || !diffOtherRunId" @click="runDiffCompare">
+                {{ diffLoading ? 'Loading…' : 'Compare' }}
+              </button>
+            </div>
+            <pre v-if="diffResultJson" class="flex-1 overflow-y-auto max-h-[55vh] p-3 text-[10px] font-mono bg-huginn-surface/50 rounded-lg border border-huginn-border/60 whitespace-pre-wrap break-words">{{ diffResultJson }}</pre>
+            <button type="button" class="text-xs text-huginn-muted self-end" @click="showDiffModal = false">Close</button>
           </div>
         </div>
       </Transition>
@@ -673,449 +970,114 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, nextTick, onMounted } from 'vue'
+import { toRef } from 'vue'
 import { useRouter } from 'vue-router'
-import { useWorkflows, type Workflow, type WorkflowStep, type WorkflowTemplate, type WorkflowRun, type WorkflowEvent } from '../composables/useWorkflows'
-import { getToken } from '../composables/useApi'
-import { useAgents } from '../composables/useAgents'
 import AgentPicker from '../components/AgentPicker.vue'
-import { remapIndex } from '../utils/remapIndex'
+import { useWorkflowsViewState } from './workflows/useWorkflowsViewState'
 
-const props = defineProps<{ id?: string }>()
+const props = defineProps<{ id?: string; runId?: string }>()
 const router = useRouter()
 
-const { workflows, loading, liveEvents, fetchWorkflows, fetchTemplates, createWorkflow, updateWorkflow, deleteWorkflow, triggerWorkflow, cancelWorkflow, fetchWorkflowRuns } = useWorkflows()
-const { agents: agentList } = useAgents()
-
-const search = ref('')
-const selectedId = ref<string | null>(props.id || null)
-const selectedWorkflow = ref<Workflow | null>(null)
-const showCreate = ref(false)
-const showHistory = ref(false)
-const saving = ref(false)
-const saveMsg = ref('')
-const saveError = ref(false)
-const running = ref(false)
-const cancelling = ref(false) // optimistic: set immediately on cancel click, cleared on workflow_cancelled WS event
-const expandedSteps = ref<Set<number>>(new Set())
-const dragFrom = ref<number | null>(null)
-const dragOver = ref<number | null>(null)
-const runs = ref<WorkflowRun[]>([])
-const loadingHistory = ref(false)
-const expandedRunId = ref<string | null>(null)
-const templates = ref<WorkflowTemplate[]>([])
-const loadingTemplates = ref(false)
-const eventsRef = ref<HTMLElement | null>(null)
-
-const stepAgentDetails = ref<Record<number, Record<string, unknown>>>({})
-
-const availableSpaces = ref<Array<{id: string, name: string, kind: string}>>([])
-
-const editForm = ref<{
-  name: string
-  description: string
-  enabled: boolean
-  schedule: string
-  timeout_minutes: number
-  tags: string[]
-  steps: WorkflowStep[]
-  notification: {
-    on_success?: boolean
-    on_failure?: boolean
-    severity?: string
-    deliver_to?: Array<{ type: string; space_id?: string }>
-  }
-}>({
-  name: '',
-  description: '',
-  enabled: false,
-  schedule: '',
-  timeout_minutes: 0,
-  tags: [],
-  steps: [],
-  notification: { on_success: false, on_failure: true, severity: 'info' },
-})
-
-const filteredWorkflows = computed(() => {
-  if (!search.value) return workflows.value
-  const q = search.value.toLowerCase()
-  return workflows.value.filter(w =>
-    w.name.toLowerCase().includes(q) ||
-    (w.description || '').toLowerCase().includes(q) ||
-    (w.tags || []).some(t => t.toLowerCase().includes(q))
-  )
-})
-
-const currentRunEvents = computed(() => {
-  if (!selectedId.value) return []
-  return liveEvents.value[selectedId.value] || []
-})
-
-onMounted(async () => {
-  await fetchWorkflows()
-  fetchSpaces()
-  if (props.id) openById(props.id)
-})
-
-watch(() => props.id, (id) => {
-  if (id) openById(id)
-  else closeWorkflow()
-})
-
-// When a running workflow finishes (any terminal state), clear the cancelling flag.
-watch(running, (isRunning) => {
-  if (!isRunning) cancelling.value = false
-})
-
-watch(showHistory, async (open) => {
-  if (open && selectedId.value) {
-    expandedRunId.value = null
-    loadingHistory.value = true
-    runs.value = await fetchWorkflowRuns(selectedId.value)
-    loadingHistory.value = false
-  } else {
-    expandedRunId.value = null
-  }
-})
-
-watch(showCreate, async (open) => {
-  if (open && !templates.value.length) {
-    loadingTemplates.value = true
-    templates.value = await fetchTemplates()
-    loadingTemplates.value = false
-  }
-})
-
-watch(currentRunEvents, async () => {
-  await nextTick()
-  if (eventsRef.value) {
-    eventsRef.value.scrollTop = eventsRef.value.scrollHeight
-  }
-})
-
-async function fetchSpaces() {
-  try {
-    const token = getToken()
-    const data = await fetch('/api/v1/spaces', {
-      headers: { Authorization: `Bearer ${token}` }
-    }).then(r => r.json())
-    availableSpaces.value = Array.isArray(data) ? data : []
-  } catch { /* ignore */ }
-}
-
-function onAgentSelected(stepIdx: number, agent: Record<string, unknown>) {
-  stepAgentDetails.value[stepIdx] = agent
-}
-
-// Clear stale agent detail card when the agent field is manually cleared
-watch(
-  () => editForm.value.steps.map(s => s.agent),
-  (agents) => {
-    agents.forEach((agent, idx) => {
-      if (!agent && stepAgentDetails.value[idx]) {
-        const next = { ...stepAgentDetails.value }
-        delete next[idx]
-        stepAgentDetails.value = next
-      }
-    })
-  },
-  { deep: false }
+const {
+  loading,
+  liveEvents,
+  search,
+  selectedId,
+  selectedWorkflow,
+  showCreate,
+  showHistory,
+  saving,
+  saveMsg,
+  saveError,
+  running,
+  cancelling,
+  expandedSteps,
+  dragFrom,
+  dragOver,
+  runs,
+  loadingHistory,
+  expandedRunId,
+  runDetailTab,
+  runDeliveries,
+  historyFeedback,
+  showForkModal,
+  forkTargetRun,
+  forkInputsJson,
+  forkUseLive,
+  forkSubmitting,
+  showDiffModal,
+  diffBaseRun,
+  diffOtherRunId,
+  diffLoading,
+  diffResultJson,
+  sessionArtifactsById,
+  sessionArtifactsLoading,
+  artifactPopoverSessionId,
+  templates,
+  loadingTemplates,
+  stepAgentDetails,
+  availableSpaces,
+  showWorkflowAdvanced,
+  stepOutputModal,
+  expandedTokenBatchIndex,
+  chainCandidateWorkflows,
+  editForm,
+  filteredWorkflows,
+  currentRunEvents,
+  displayedLiveEvents,
+  isSubWorkflowStep,
+  pickSubWorkflowStepId,
+  isTokenBatchRow,
+  onAgentSelected,
+  addStepInput,
+  removeStepInput,
+  addWorkflowDeliveryTarget,
+  removeWorkflowDeliveryTarget,
+  addStepDeliveryTarget,
+  toggleStepNotify,
+  openWorkflow,
+  closeWorkflow,
+  toggleRun,
+  closeHistory,
+  toggleArtifactPopover,
+  startReplay,
+  openForkModal,
+  submitFork,
+  openDiffModal,
+  runDiffCompare,
+  stepMetricsLine,
+  skipStepTooltip,
+  stepPillTitle,
+  copyStepOutput,
+  toggleTokenBatchExpand,
+  addStep,
+  removeStep,
+  toggleStep,
+  onDragStart,
+  onDragOver,
+  onDrop,
+  saveWorkflow,
+  triggerRun,
+  cancelRun,
+  pendingDelete,
+  confirmDelete,
+  doDeleteWorkflow,
+  clearRunEvents,
+  createBlank,
+  createFromTemplate,
+  isPlaceholderError,
+  eventIcon,
+  eventLabel,
+  retryEntry,
+  dismissEntry,
+} = useWorkflowsViewState(
+  { id: toRef(props, 'id'), runId: toRef(props, 'runId') },
+  router,
 )
 
-function addStepInput(step: WorkflowStep) {
-  if (!step.inputs) step.inputs = []
-  step.inputs.push({ from_step: '', as: '' })
-}
-
-function removeStepInput(step: WorkflowStep, idx: number) {
-  step.inputs?.splice(idx, 1)
-}
-
-function addWorkflowDeliveryTarget() {
-  if (!editForm.value.notification) editForm.value.notification = {}
-  if (!editForm.value.notification.deliver_to) editForm.value.notification.deliver_to = []
-  editForm.value.notification.deliver_to.push({ type: 'inbox' })
-}
-
-function removeWorkflowDeliveryTarget(idx: number) {
-  editForm.value.notification?.deliver_to?.splice(idx, 1)
-}
-
-function addStepDeliveryTarget(step: WorkflowStep) {
-  if (!step.notify) step.notify = {}
-  if (!step.notify.deliver_to) step.notify.deliver_to = []
-  step.notify.deliver_to.push({ type: 'inbox' })
-}
-
-function toggleStepNotify(step: WorkflowStep, enabled: boolean) {
-  if (enabled) {
-    step.notify = { on_failure: true }
-  } else {
-    step.notify = undefined
-  }
-}
-
-function openWorkflow(wf: Workflow) {
-  selectedId.value = wf.id
-  selectedWorkflow.value = wf
-  editForm.value = {
-    name: wf.name,
-    description: wf.description || '',
-    enabled: wf.enabled,
-    schedule: wf.schedule || '',
-    timeout_minutes: wf.timeout_minutes ?? 0,
-    tags: [...(wf.tags || [])],
-    steps: wf.steps.map(s => ({
-      ...s,
-      inputs: s.inputs ? s.inputs.map(inp => ({ ...inp })) : [],
-      notify: s.notify
-        ? {
-            ...s.notify,
-            deliver_to: s.notify.deliver_to ? s.notify.deliver_to.map(d => ({ ...d })) : undefined,
-          }
-        : undefined,
-    })),
-    notification: wf.notification
-      ? {
-          ...wf.notification,
-          deliver_to: wf.notification.deliver_to ? wf.notification.deliver_to.map(d => ({ ...d })) : [],
-        }
-      : { on_success: false, on_failure: true, severity: 'info', deliver_to: [] },
-  }
-  // Pre-populate agent detail cards for steps that already have an agent set.
-  // AgentPicker only fires select:agent on user interaction, so we seed details here
-  // using the shared agents list so the detail card is visible without re-picking.
-  const details: Record<number, Record<string, unknown>> = {}
-  editForm.value.steps.forEach((s, idx) => {
-    if (s.agent) {
-      const found = agentList.value.find(a => a.name === s.agent)
-      if (found) details[idx] = found as Record<string, unknown>
-    }
-  })
-  stepAgentDetails.value = details
-  expandedSteps.value = new Set()
-  router.push(`/workflows/${wf.id}`)
-}
-
-function openById(id: string) {
-  const wf = workflows.value.find(w => w.id === id)
-  if (wf) openWorkflow(wf)
-  else selectedId.value = id
-}
-
-function closeWorkflow() {
-  selectedId.value = null
-  selectedWorkflow.value = null
-  router.push('/workflows')
-}
-
-function addStep() {
-  const pos = editForm.value.steps.length
-  editForm.value.steps.push({
-    name: '',
-    agent: '',
-    prompt: '',
-    connections: {},
-    vars: {},
-    position: pos,
-    on_failure: 'stop',
-    inputs: [],
-  })
-  expandedSteps.value = new Set([...expandedSteps.value, pos])
-}
-
-function removeStep(idx: number) {
-  editForm.value.steps.splice(idx, 1)
-  editForm.value.steps.forEach((s, i) => { s.position = i })
-  const newExpanded = new Set<number>()
-  for (const n of expandedSteps.value) {
-    if (n < idx) newExpanded.add(n)
-    else if (n > idx) newExpanded.add(n - 1)
-  }
-  expandedSteps.value = newExpanded
-  // Clean up agent details for removed step
-  const newDetails: Record<number, Record<string, unknown>> = {}
-  for (const key in stepAgentDetails.value) {
-    const k = Number(key)
-    if (k < idx) newDetails[k] = stepAgentDetails.value[k]!
-    else if (k > idx) newDetails[k - 1] = stepAgentDetails.value[k]!
-  }
-  stepAgentDetails.value = newDetails
-}
-
-function toggleStep(idx: number) {
-  const next = new Set(expandedSteps.value)
-  if (next.has(idx)) next.delete(idx)
-  else next.add(idx)
-  expandedSteps.value = next
-}
-
-function onDragStart(idx: number, e: DragEvent) {
-  dragFrom.value = idx
-  if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move'
-}
-
-function onDragOver(idx: number) {
-  dragOver.value = idx
-}
-
-function onDrop(toIdx: number) {
-  if (dragFrom.value === null || dragFrom.value === toIdx) {
-    dragFrom.value = null
-    dragOver.value = null
-    return
-  }
-  const fromIdx = dragFrom.value
-  const steps = [...editForm.value.steps]
-  const [moved] = steps.splice(fromIdx, 1)
-  if (!moved) return
-  steps.splice(toIdx, 0, moved)
-  steps.forEach((s, i) => { s.position = i })
-  editForm.value.steps = steps
-
-  // Remap expandedSteps indices to match new order
-  const newExpanded = new Set<number>()
-  for (const n of expandedSteps.value) {
-    const remapped = remapIndex(n, fromIdx, toIdx)
-    if (remapped !== null) newExpanded.add(remapped)
-  }
-  expandedSteps.value = newExpanded
-
-  // Remap stepAgentDetails indices to match new order
-  const newDetails: Record<number, Record<string, unknown>> = {}
-  for (const key in stepAgentDetails.value) {
-    const k = Number(key)
-    const remapped = remapIndex(k, fromIdx, toIdx)
-    if (remapped !== null) newDetails[remapped] = stepAgentDetails.value[k]!
-  }
-  stepAgentDetails.value = newDetails
-
-  dragFrom.value = null
-  dragOver.value = null
-}
-
-
-async function saveWorkflow() {
-  if (!selectedId.value || !selectedWorkflow.value) return
-  saving.value = true
-  saveError.value = false
-  saveMsg.value = ''
-  try {
-    const wf: Workflow = {
-      ...selectedWorkflow.value,
-      ...editForm.value,
-      steps: editForm.value.steps.map((s, i) => ({ ...s, position: i })),
-    }
-    const updated = await updateWorkflow(selectedId.value, wf)
-    selectedWorkflow.value = updated
-  } catch (e) {
-    saveError.value = true
-    saveMsg.value = e instanceof Error ? e.message : 'Failed to save workflow. Please try again.'
-  } finally {
-    saving.value = false
-  }
-}
-
-async function triggerRun() {
-  if (!selectedId.value || running.value) return
-  running.value = true
-  cancelling.value = false
-  try {
-    await triggerWorkflow(selectedId.value)
-  } catch {
-    // error handled by composable
-  } finally {
-    setTimeout(() => { running.value = false }, 1000)
-  }
-}
-
-async function cancelRun() {
-  if (!selectedId.value || cancelling.value) return
-  cancelling.value = true
-  try {
-    await cancelWorkflow(selectedId.value)
-    // cancelling stays true until the workflow_cancelled WS event arrives and
-    // fetchWorkflows() updates the run list, at which point running becomes false.
-  } catch {
-    cancelling.value = false
-  }
-}
-
-const pendingDelete = ref<{ id: string; name: string } | null>(null)
-
-function confirmDelete() {
-  if (!selectedWorkflow.value) return
-  pendingDelete.value = selectedWorkflow.value
-}
-
-async function doDeleteWorkflow() {
-  if (!pendingDelete.value) return
-  await deleteWorkflow(pendingDelete.value.id)
-  pendingDelete.value = null
-  closeWorkflow()
-}
-
-function clearRunEvents() {
-  if (selectedId.value) {
-    delete liveEvents.value[selectedId.value]
-  }
-}
-
-async function createBlank() {
-  showCreate.value = false
-  const wf = await createWorkflow({
-    name: 'New Workflow',
-    enabled: false,
-    schedule: '',
-    steps: [],
-  })
-  openWorkflow(wf)
-}
-
-async function createFromTemplate(tpl: WorkflowTemplate) {
-  showCreate.value = false
-  const wf = await createWorkflow({
-    name: tpl.workflow.name,
-    description: tpl.workflow.description,
-    enabled: false,
-    schedule: tpl.workflow.schedule,
-    steps: tpl.workflow.steps,
-    notification: tpl.workflow.notification,
-  })
-  openWorkflow(wf)
-}
-
-// isPlaceholderError returns true when an error string indicates that the
-// step failed due to unresolved template placeholders (a config error, not a
-// runtime error). These are shown in amber rather than red.
-function isPlaceholderError(error?: string): boolean {
-  return !!error && error.includes('unresolved template placeholders')
-}
-
-function eventIcon(ev: WorkflowEvent): string {
-  if (ev.type === 'workflow_step_complete' && ev.status === 'failed' && isPlaceholderError(ev.error)) {
-    return '⚠'
-  }
-  switch (ev.type) {
-    case 'workflow_started': return '▶'
-    case 'workflow_step_complete': return ev.status === 'success' ? '✓' : '✗'
-    case 'workflow_complete': return '✓'
-    case 'workflow_failed': return '✗'
-    case 'workflow_cancelled': return '⊘'
-    default: return '·'
-  }
-}
-
-function eventLabel(ev: WorkflowEvent): string {
-  switch (ev.type) {
-    case 'workflow_started': return `Started: ${ev.workflow_name || 'workflow'}`
-    case 'workflow_step_complete': return `Step ${ev.position}: ${ev.slug || 'done'} [${ev.status}]`
-    case 'workflow_complete': return 'Workflow completed'
-    case 'workflow_failed': return 'Workflow failed'
-    case 'workflow_cancelled': return 'Workflow cancelled by user'
-    default: return ev.type
-  }
-}
+defineExpose({
+  liveEvents,
+})
 </script>
 
 <style scoped>

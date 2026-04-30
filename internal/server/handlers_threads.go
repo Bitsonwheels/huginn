@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/scrypster/huginn/internal/agents"
+	"github.com/scrypster/huginn/internal/session"
 	"github.com/scrypster/huginn/internal/threadmgr"
 )
 
@@ -16,17 +17,29 @@ import (
 // (workforce contract endpoints GET /api/v1/messages/:id/thread and
 // GET /api/v1/containers/:id/threads).
 type threadMessageRow struct {
-	ID                  string    `json:"id"`
-	ContainerID         string    `json:"container_id"`
-	Seq                 int64     `json:"seq"`
-	Ts                  time.Time `json:"ts"`
-	Role                string    `json:"role"`
-	Content             string    `json:"content"`
-	Agent               string    `json:"agent"`
-	ToolName            string    `json:"tool_name,omitempty"`
-	ParentMessageID     string    `json:"parent_message_id,omitempty"`
-	TriggeringMessageID string    `json:"triggering_message_id,omitempty"`
-	ThreadReplyCount    int       `json:"thread_reply_count"`
+	ID                  string                      `json:"id"`
+	ContainerID         string                      `json:"container_id"`
+	Seq                 int64                       `json:"seq"`
+	Ts                  time.Time                   `json:"ts"`
+	Role                string                      `json:"role"`
+	Content             string                      `json:"content"`
+	Agent               string                      `json:"agent"`
+	ToolName            string                      `json:"tool_name,omitempty"`
+	ParentMessageID     string                      `json:"parent_message_id,omitempty"`
+	TriggeringMessageID string                      `json:"triggering_message_id,omitempty"`
+	ThreadReplyCount    int                         `json:"thread_reply_count"`
+	ToolCalls           []session.PersistedToolCall `json:"tool_calls,omitempty"`
+}
+
+// MessageThreadResponse is the JSON body returned by GET /api/v1/messages/:id/thread.
+// DelegationChain lists the to_agent values of all delegations in the session ordered
+// by created_at ASC. It is session-scoped (not thread-scoped) because the delegations
+// table has no direct FK to the parent thread. Always a non-nil slice.
+type MessageThreadResponse struct {
+	Messages        []threadMessageRow `json:"messages"`
+	ThreadID        string             `json:"thread_id,omitempty"`
+	SessionID       string             `json:"session_id,omitempty"`
+	DelegationChain []string           `json:"delegation_chain"`
 }
 
 // handleGetMessageThread returns all reply messages for a given parent message ID,
@@ -42,7 +55,7 @@ func (s *Server) handleGetMessageThread(w http.ResponseWriter, r *http.Request) 
 
 	if s.db == nil {
 		// No SQLite DB wired — return empty array (e.g. in tests using file-backed store).
-		jsonOK(w, []threadMessageRow{})
+		jsonOK(w, MessageThreadResponse{Messages: []threadMessageRow{}, DelegationChain: []string{}})
 		return
 	}
 
@@ -51,6 +64,18 @@ func (s *Server) handleGetMessageThread(w http.ResponseWriter, r *http.Request) 
 		jsonError(w, http.StatusServiceUnavailable, "database not available")
 		return
 	}
+
+	// First, resolve the thread_id and session_id for this message.
+	var threadID, sessionID string
+	threadRow := rdb.QueryRowContext(r.Context(), `
+	    SELECT id, CASE WHEN parent_type = 'session' THEN parent_id ELSE '' END
+	    FROM threads WHERE parent_msg_id = ? LIMIT 1`,
+		messageID,
+	)
+	// Scan errors are intentionally ignored: if the thread row does not exist yet
+	// (in-flight delegation or invalid message ID), threadID and sessionID remain
+	// empty strings. An empty sessionID disables the delegation chain lookup below.
+	_ = threadRow.Scan(&threadID, &sessionID)
 
 	// Query messages that belong to the thread container for this parent message.
 	// We only return thread-scoped messages (container_type='thread') so that
@@ -63,7 +88,8 @@ func (s *Server) handleGetMessageThread(w http.ResponseWriter, r *http.Request) 
 		       COALESCE(tool_name, ''),
 		       COALESCE(parent_message_id, ''),
 		       COALESCE(triggering_message_id, ''),
-		       COALESCE(thread_reply_count, 0)
+		       COALESCE(thread_reply_count, 0),
+		       COALESCE(tool_calls_json, '')
 		FROM messages
 		WHERE container_type = 'thread'
 		  AND container_id IN (
@@ -84,7 +110,22 @@ func (s *Server) handleGetMessageThread(w http.ResponseWriter, r *http.Request) 
 		jsonError(w, http.StatusInternalServerError, "scan thread: "+err.Error())
 		return
 	}
-	jsonOK(w, msgs)
+
+	delegationChain := []string{}
+	if s.delegationStore != nil && sessionID != "" {
+		recs, err2 := s.delegationStore.ListDelegationsBySession(sessionID, 50, 0)
+		if err2 == nil {
+			for _, r := range recs {
+				delegationChain = append(delegationChain, r.ToAgent)
+			}
+		}
+	}
+	jsonOK(w, MessageThreadResponse{
+		Messages:        msgs,
+		ThreadID:        threadID,
+		SessionID:       sessionID,
+		DelegationChain: delegationChain,
+	})
 }
 
 // handleGetContainerThreads returns all root messages in a container that have
@@ -119,7 +160,8 @@ func (s *Server) handleGetContainerThreads(w http.ResponseWriter, r *http.Reques
 		       COALESCE(m.tool_name, ''),
 		       COALESCE(m.parent_message_id, ''),
 		       COALESCE(m.triggering_message_id, ''),
-		       COALESCE(m.thread_reply_count, 0)
+		       COALESCE(m.thread_reply_count, 0),
+		       COALESCE(m.tool_calls_json, '')
 		FROM messages m
 		LEFT JOIN threads t ON t.parent_msg_id = m.id
 		WHERE m.container_type = 'session' AND m.container_id = ?
@@ -149,16 +191,20 @@ func scanThreadMessageRows(rows *sql.Rows) ([]threadMessageRow, error) {
 	for rows.Next() {
 		var m threadMessageRow
 		var tsStr string
+		var toolCallsJSON string
 		if err := rows.Scan(
 			&m.ID, &m.ContainerID, &m.Seq, &tsStr,
 			&m.Role, &m.Content, &m.Agent, &m.ToolName,
 			&m.ParentMessageID, &m.TriggeringMessageID,
-			&m.ThreadReplyCount,
+			&m.ThreadReplyCount, &toolCallsJSON,
 		); err != nil {
 			return nil, err
 		}
 		if t, e := time.Parse(time.RFC3339, tsStr); e == nil {
 			m.Ts = t.UTC()
+		}
+		if toolCallsJSON != "" {
+			_ = json.Unmarshal([]byte(toolCallsJSON), &m.ToolCalls)
 		}
 		out = append(out, m)
 	}

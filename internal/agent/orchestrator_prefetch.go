@@ -2,8 +2,10 @@ package agent
 
 import (
 	"context"
+	"strings"
 	"time"
 
+	"github.com/scrypster/huginn/internal/proactivity"
 	"github.com/scrypster/huginn/internal/tools"
 )
 
@@ -117,6 +119,34 @@ const (
 	prefetchMaxItems = 20
 )
 
+type continuityModeCtxKey struct{}
+
+const (
+	// ContinuityModeConversational is the default interactive-chat behavior.
+	ContinuityModeConversational = "conversational"
+	// ContinuityModeDeterministic is the workflow-safe, task-scoped behavior.
+	ContinuityModeDeterministic = "deterministic"
+)
+
+// WithContinuityMode sets how continuity context is assembled for this request.
+func WithContinuityMode(ctx context.Context, mode string) context.Context {
+	mode = strings.TrimSpace(strings.ToLower(mode))
+	switch mode {
+	case ContinuityModeDeterministic, ContinuityModeConversational:
+		return context.WithValue(ctx, continuityModeCtxKey{}, mode)
+	default:
+		return ctx
+	}
+}
+
+func continuityModeFromContext(ctx context.Context) proactivity.ContinuityMode {
+	mode, _ := ctx.Value(continuityModeCtxKey{}).(string)
+	if mode == ContinuityModeDeterministic {
+		return proactivity.ContinuityModeDeterministic
+	}
+	return proactivity.ContinuityModeConversational
+}
+
 // prefetchMemoryContext silently calls muninn_where_left_off (if registered)
 // and returns a formatted block ready to append to the system prompt.
 // Returns "" if the tool is unavailable, times out, or errors.
@@ -129,58 +159,95 @@ const (
 //
 // Phase 4: when userMsg is non-empty, also calls muninn_recall for semantic context.
 func (o *Orchestrator) prefetchMemoryContext(ctx context.Context, sessionReg *tools.Registry, agentName, vaultName, userMsg string) string {
+	return o.prefetchMemoryContextWithEvents(ctx, sessionReg, agentName, vaultName, userMsg, nil)
+}
+
+// prefetchMemoryContextWithEvents is identical to prefetchMemoryContext but
+// invokes onPrefetch when a muninn_* call actually fires (i.e. on cache miss
+// or first call). The callback runs synchronously after the tool returns; it
+// must not block. Used by the WS path to surface synthetic tool_call /
+// tool_result events to the UI so the user can see "agent recalled memory"
+// even when the call happens in the silent prefetch phase.
+//
+// onPrefetch may be nil — in which case behaviour is identical to the
+// no-event variant above. cached=true indicates this invocation served the
+// block from cache without dispatching a real MCP call (callers can use this
+// to suppress duplicate UI events).
+func (o *Orchestrator) prefetchMemoryContextWithEvents(
+	ctx context.Context,
+	sessionReg *tools.Registry,
+	agentName, vaultName, userMsg string,
+	onPrefetch func(toolName string, args map[string]any, output string, cached bool),
+) string {
 	if sessionReg == nil {
 		return ""
 	}
-	tool, ok := sessionReg.Get("muninn_where_left_off")
-	if !ok {
+	whereTool, hasWhere := sessionReg.Get("muninn_where_left_off")
+	recallTool, hasRecall := sessionReg.Get("muninn_recall")
+	if !hasWhere && !hasRecall {
 		return ""
 	}
 
-	// Cache only the where_left_off block (not recall) under the agent+vault key.
 	wloKey := agentName + ":" + vaultName
-	wloBlock := o.getCachedMemoryPrefetch(wloKey)
-	if wloBlock == "" {
-		// Hard timeout so we never stall the chat waiting for a slow Muninn server.
-		prefetchCtx, cancel := context.WithTimeout(ctx, prefetchTimeout)
-		result := tool.Execute(prefetchCtx, map[string]any{})
-		cancel()
-		if result.IsError || result.Output == "" {
-			return ""
-		}
-		content := trimToLines(result.Output, prefetchMaxItems)
-		wloBlock = "## Memory Context\n\n" + content + "\n\n"
-		o.setCachedMemoryPrefetch(wloKey, wloBlock)
-	}
-
-	formatted := wloBlock
-
-	// Phase 4: per-message semantic recall. Always fetched/cached independently of
-	// where_left_off so each unique message gets its own relevant memories.
-	if userMsg != "" {
-		if recallTool, ok := sessionReg.Get("muninn_recall"); ok {
-			recallKey := agentName + ":" + vaultName + ":recall:" + hashMessage(userMsg)
-			if recallBlock := o.getCachedSemanticPrefetch(recallKey); recallBlock != "" {
-				formatted += recallBlock
-			} else {
-				recallCtx, recallCancel := context.WithTimeout(ctx, prefetchTimeout)
-				recallResult := recallTool.Execute(recallCtx, map[string]any{
-					"context":   []string{userMsg},
-					"mode":      "balanced",
-					"limit":     5,
-					"threshold": 0.6,
-				})
-				recallCancel()
-				if !recallResult.IsError && recallResult.Output != "" {
-					block := "## Relevant Memory\n\n" + trimToLines(recallResult.Output, 10) + "\n\n"
-					o.setCachedSemanticPrefetch(recallKey, block)
-					formatted += block
+	whereOutput := ""
+	if hasWhere {
+		whereOutput = o.getCachedMemoryPrefetch(wloKey)
+		switch {
+		case whereOutput != "":
+			if onPrefetch != nil {
+				onPrefetch("muninn_where_left_off", map[string]any{}, whereOutput, true)
+			}
+		default:
+			prefetchCtx, cancel := context.WithTimeout(ctx, prefetchTimeout)
+			result := whereTool.Execute(prefetchCtx, map[string]any{})
+			cancel()
+			if !result.IsError && result.Output != "" {
+				whereOutput = trimToLines(result.Output, prefetchMaxItems)
+				o.setCachedMemoryPrefetch(wloKey, whereOutput)
+				if onPrefetch != nil {
+					onPrefetch("muninn_where_left_off", map[string]any{}, whereOutput, false)
 				}
 			}
 		}
 	}
 
-	return formatted
+	recallOutput := ""
+	if userMsg != "" {
+		if hasRecall {
+			recallKey := agentName + ":" + vaultName + ":recall:" + hashMessage(userMsg)
+			recallArgs := map[string]any{
+				"context":   []string{userMsg},
+				"mode":      "balanced",
+				"limit":     5,
+				"threshold": 0.6,
+			}
+			if cachedRecall := o.getCachedSemanticPrefetch(recallKey); cachedRecall != "" {
+				recallOutput = cachedRecall
+				if onPrefetch != nil {
+					onPrefetch("muninn_recall", recallArgs, recallOutput, true)
+				}
+			} else {
+				recallCtx, recallCancel := context.WithTimeout(ctx, prefetchTimeout)
+				recallResult := recallTool.Execute(recallCtx, recallArgs)
+				recallCancel()
+				if !recallResult.IsError && recallResult.Output != "" {
+					recallOutput = trimToLines(recallResult.Output, 10)
+					o.setCachedSemanticPrefetch(recallKey, recallOutput)
+					if onPrefetch != nil {
+						onPrefetch("muninn_recall", recallArgs, recallOutput, false)
+					}
+				}
+			}
+		}
+	}
+
+	mode := continuityModeFromContext(ctx)
+	return proactivity.AssembleContinuityPack(proactivity.ContinuityPackInput{
+		Mode:               mode,
+		UserMessage:        userMsg,
+		WhereLeftOffOutput: whereOutput,
+		RecallOutput:       recallOutput,
+	})
 }
 
 // trimToLines returns at most n lines from s, appending "…" if truncated.

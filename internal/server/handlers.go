@@ -74,9 +74,16 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		relayInfo["dropped_messages"] = hub.WSDroppedMessages()
 	}
 
+	s.mu.Lock()
+	ver := s.version
+	s.mu.Unlock()
+	if ver == "" {
+		ver = "dev"
+	}
+
 	jsonOK(w, map[string]any{
 		"status":              "ok",
-		"version":             "0.2.0",
+		"version":             ver,
 		"satellite_connected": satConnected, // preserved for backward compatibility
 		"relay":               relayInfo,
 	})
@@ -376,6 +383,19 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, 422, "invalid agent: "+err.Error())
 		return
 	}
+	toolbeltResult, err := s.evaluateToolbelt(incoming.Toolbelt)
+	if err != nil {
+		jsonError(w, 500, "validate toolbelt: "+err.Error())
+		return
+	}
+	if !toolbeltResult.Valid {
+		if denied, ok := toolbeltResult.FirstDenied(); ok {
+			jsonError(w, 422, fmt.Sprintf("invalid toolbelt: %s (%s)", denied.Reason, denied.ReasonCode))
+			return
+		}
+		jsonError(w, 422, "invalid toolbelt")
+		return
+	}
 	if err := agents.SaveAgentDefault(incoming); err != nil {
 		jsonError(w, 500, "save agent: "+err.Error())
 		return
@@ -383,6 +403,12 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 	// If this was a rename, delete the old agent file.
 	if isRename {
 		_ = agents.DeleteAgentDefault(name) // best effort; ignore error
+	}
+	// Heartbeat lifecycle: sync or remove the managed workflow YAML.
+	if isRename {
+		_ = agents.RenameHeartbeatYAMLDefault(name, incoming) // best effort
+	} else {
+		_ = agents.SyncHeartbeatYAMLDefault(incoming) // best effort
 	}
 	// Broadcast so all connected frontends refresh their agent list.
 	action := "updated"
@@ -398,7 +424,6 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 	})
 	jsonOK(w, map[string]string{"saved": incoming.Name})
 }
-
 
 func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 	// Return the configured models from the config
@@ -432,9 +457,9 @@ func (s *Server) handleListAvailableModels(w http.ResponseWriter, r *http.Reques
 
 	// Built-in llama.cpp managed models.
 	type builtinModel struct {
-		Name    string `json:"name"`
-		Source  string `json:"source"`
-		SizeBytes int64 `json:"size_bytes,omitempty"`
+		Name      string `json:"name"`
+		Source    string `json:"source"`
+		SizeBytes int64  `json:"size_bytes,omitempty"`
 	}
 	var builtinModels []builtinModel
 	if s.modelStore != nil {
@@ -659,6 +684,7 @@ func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, 404, err.Error())
 		return
 	}
+	_ = agents.DeleteHeartbeatYAMLDefault(name) // best effort; ignore error
 	// Broadcast so all connected frontends remove the deleted agent.
 	s.BroadcastWS(WSMessage{
 		Type: "agent_changed",
@@ -668,6 +694,109 @@ func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 		},
 	})
 	jsonOK(w, map[string]bool{"deleted": true})
+}
+
+// handleCloneAgent (Phase 7) clones an existing agent under a new name and
+// optionally swaps its model. The use case is "Use Haiku for the classifier,
+// Sonnet for the writer, Opus for the auditor": users clone an existing,
+// well-tuned agent and just bump the model.
+//
+//	POST /api/v1/agents/{name}/clone
+//	body: {"new_name": "Bob-Sonnet", "model": "claude-sonnet-4-6", "provider": "anthropic"}
+//
+// Response: 200 + the redacted clone, or 4xx on validation errors. The
+// source agent is never modified. Skills, memory mode, vault description and
+// every other field are copied verbatim — only Name (mandatory) and Model /
+// Provider / Endpoint (optional) are overrideable.
+func (s *Server) handleCloneAgent(w http.ResponseWriter, r *http.Request) {
+	source := r.PathValue("name")
+	if source == "" {
+		jsonError(w, 400, "source agent name is required")
+		return
+	}
+	var body struct {
+		NewName  string `json:"new_name"`
+		Model    string `json:"model"`
+		Provider string `json:"provider"`
+		Endpoint string `json:"endpoint"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		jsonError(w, 400, "invalid JSON: "+err.Error())
+		return
+	}
+	if strings.TrimSpace(body.NewName) == "" {
+		jsonError(w, 400, "new_name is required")
+		return
+	}
+	if strings.EqualFold(body.NewName, source) {
+		jsonError(w, 400, "new_name must differ from source agent name")
+		return
+	}
+
+	cfg, err := agents.LoadAgents()
+	if err != nil || cfg == nil {
+		cfg = agents.DefaultAgentsConfig()
+	}
+	var src *agents.AgentDef
+	for i := range cfg.Agents {
+		if strings.EqualFold(cfg.Agents[i].Name, source) {
+			src = &cfg.Agents[i]
+			break
+		}
+	}
+	if src == nil {
+		jsonError(w, 404, "source agent not found")
+		return
+	}
+	// Reject target-name collisions early so we don't write a half-baked
+	// agent and then have to undo it.
+	for _, a := range cfg.Agents {
+		if strings.EqualFold(a.Name, body.NewName) {
+			jsonError(w, 409, "agent name already exists")
+			return
+		}
+	}
+
+	clone := *src // shallow copy is fine: AgentDef is value-only, no pointers besides MemoryEnabled.
+	clone.Name = body.NewName
+	clone.ID = "" // force a fresh id assignment downstream
+	clone.IsDefault = false
+	clone.Version = 0                       // version starts at 0 for new agents
+	clone.CreatedAt = ""                    // SaveAgentDefault stamps it
+	if mb := src.MemoryEnabled; mb != nil { // deep-copy the *bool to break sharing
+		v := *mb
+		clone.MemoryEnabled = &v
+	}
+	if strings.TrimSpace(body.Model) != "" {
+		clone.Model = body.Model
+	}
+	if strings.TrimSpace(body.Provider) != "" {
+		clone.Provider = body.Provider
+	} else if body.Model != "" && body.Provider == "" {
+		// Re-infer provider from the new model when the caller swaps model
+		// but not provider (the most common case).
+		clone.Provider = agents.InferProvider(clone.Model)
+	}
+	if strings.TrimSpace(body.Endpoint) != "" {
+		clone.Endpoint = body.Endpoint
+	}
+	if err := clone.Validate(); err != nil {
+		jsonError(w, 422, "invalid clone: "+err.Error())
+		return
+	}
+	if err := agents.SaveAgentDefault(clone); err != nil {
+		jsonError(w, 500, "save clone: "+err.Error())
+		return
+	}
+	s.BroadcastWS(WSMessage{
+		Type: "agent_changed",
+		Payload: map[string]any{
+			"name":   clone.Name,
+			"action": "created",
+			"source": source,
+		},
+	})
+	jsonOK(w, redactAgentDef(clone))
 }
 
 // stateString converts an agent.State to a human-readable string.
@@ -1059,8 +1188,17 @@ func (s *Server) handleCloudConnect(w http.ResponseWriter, r *http.Request) {
 		if s.openBrowserFn != nil {
 			reg.OpenBrowserFn = s.openBrowserFn
 		}
+		if s.cloudRegisterPollInterval > 0 {
+			reg.PollInterval = s.cloudRegisterPollInterval
+		}
+		regTimeout := s.cloudRegisterTimeout
 		s.mu.Unlock()
 		ctx := context.WithoutCancel(r.Context())
+		if regTimeout > 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, regTimeout)
+			defer cancel()
+		}
 		if _, err := reg.Register(ctx, hostname); err != nil {
 			slog.Warn("cloud: registration failed", "err", err)
 			return

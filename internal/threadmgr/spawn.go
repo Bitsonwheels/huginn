@@ -146,7 +146,30 @@ func (tm *ThreadManager) SpawnThread(
 		helpResolver := tm.helpResolver
 		completionNotifier := tm.completionNotifier
 		resolveBackend := tm.backendFor
+		preparer := tm.runtimePreparer
 		tm.mu.RUnlock()
+
+		// Build per-agent runtime (toolbelt + MuninnDB vault + memory_mode
+		// prompt). Do this once per thread so we connect the vault and fork
+		// the gate exactly once, then re-use across help-block resume cycles.
+		// On preparer error or nil runtime we fall back to the legacy global
+		// toolRegistry/toolExecutor path — vault outages must not kill
+		// delegation, and tests can opt out by leaving the preparer unset.
+		var runtime *AgentRuntime
+		if preparer != nil {
+			rt, prepErr := preparer(threadCtx, agentID)
+			if prepErr != nil {
+				slog.Warn("threadmgr: AgentRuntimePreparer failed; falling back to global toolset",
+					"thread_id", threadID, "agent", agentID, "err", prepErr)
+			} else if rt != nil {
+				runtime = rt
+				defer func() {
+					if runtime != nil && runtime.Cleanup != nil {
+						runtime.Cleanup()
+					}
+				}()
+			}
+		}
 
 		// Resolve the correct backend for this agent's provider. The raw `b`
 		// passed to SpawnThread is the fallback (often Ollama on localhost).
@@ -177,7 +200,7 @@ func (tm *ThreadManager) SpawnThread(
 		var injectedInput string
 		var tokenCounter int64
 		for {
-			result := tm.runOnce(threadCtx, threadID, agentID, injectedInput, sess, store, reg, agentBackend, broadcast, ca, dagFn, helpResolver, completionNotifier, emitter, &tokenCounter)
+			result := tm.runOnce(threadCtx, threadID, agentID, injectedInput, sess, store, reg, agentBackend, broadcast, ca, dagFn, helpResolver, completionNotifier, emitter, &tokenCounter, runtime)
 			if result.kind == loopDone {
 				return
 			}
@@ -219,6 +242,7 @@ func (tm *ThreadManager) runOnce(
 	completionNotifier *CompletionNotifier,
 	emitter *EventEmitter,
 	tokenCounter *int64,
+	runtime *AgentRuntime,
 ) (result loopResult) {
 	result = loopResult{kind: loopDone} // default: done
 
@@ -233,6 +257,7 @@ func (tm *ThreadManager) runOnce(
 		if r := recover(); r != nil {
 			switch v := r.(type) {
 			case *ErrFinish:
+				tm.PublishSiblingContext(threadID, "completed: "+v.Summary.Summary)
 				tm.Complete(threadID, v.Summary)
 				broadcast(sess.ID, "thread_done", map[string]any{
 					"thread_id":  threadID,
@@ -258,6 +283,7 @@ func (tm *ThreadManager) runOnce(
 				result = loopResult{kind: loopDone}
 
 			case *ErrHelp:
+				tm.PublishSiblingContext(threadID, "blocked: "+v.Message)
 				tm.setBlocked(threadID, v.Message)
 				if helpResolver != nil {
 					go func(msg string) {
@@ -344,15 +370,31 @@ func (tm *ThreadManager) runOnce(
 	toolExec := tm.toolExecutor
 	tm.mu.RUnlock()
 
-	tt := &ThreadTools{}
+	tm.mu.RLock()
+	proposals := tm.proposalRegistry
+	tm.mu.RUnlock()
+
+	tt := &ThreadTools{
+		ThreadID:  threadID,
+		SessionID: sess.ID,
+		AgentID:   agentID,
+		Proposals: proposals,
+	}
 	tools := []backend.Tool{
 		tt.FinishSchema(),
 		tt.RequestHelpSchema(),
+		tt.ProposeActionSchema(),
 	}
 
-	// Append agent-specific local tools based on the agent's local_tools config.
-	// Wildcard ["*"] → all builtin schemas; named list → matching schemas only.
-	if toolReg != nil && reg != nil {
+	// Per-agent runtime path: schemas come from the orchestrator-built
+	// runtime (toolbelt + MuninnDB vault + skills/connections). When unset
+	// or empty, fall back to local_tools resolved against the global
+	// toolRegistry — preserves behaviour for tests and memory-disabled
+	// agents that the runtime preparer chooses not to populate.
+	switch {
+	case runtime != nil && len(runtime.Schemas) > 0:
+		tools = append(tools, runtime.Schemas...)
+	case toolReg != nil && reg != nil:
 		if ag, found := reg.ByName(agentID); found {
 			switch {
 			case len(ag.LocalTools) == 1 && ag.LocalTools[0] == "*":
@@ -362,8 +404,28 @@ func (tm *ThreadManager) runOnce(
 			}
 		}
 	}
+
 	// Build initial context messages.
 	history = buildContext(thread, store, tm, reg)
+
+	// If the runtime supplies a system prompt addendum (memory_mode +
+	// memory_block), append it to the persona system message produced by
+	// buildContext. buildContext always emits a leading system message, but
+	// guard against future changes by prepending a fresh system message
+	// when the head role differs.
+	if runtime != nil && runtime.ExtraSystem != "" {
+		if len(history) > 0 && history[0].Role == "system" {
+			history[0].Content += runtime.ExtraSystem
+		} else {
+			history = append([]backend.Message{{Role: "system", Content: runtime.ExtraSystem}}, history...)
+		}
+	}
+	if sibling := tm.SiblingContext(threadID, 8); len(sibling) > 0 {
+		history = append(history, backend.Message{
+			Role:    "user",
+			Content: formatSiblingContextBlock(sibling),
+		})
+	}
 	logger.Info("runOnce: context built", "thread_id", threadID, "history_len", len(history))
 	// Log roles for debugging the "must end with user message" constraint.
 	if len(history) > 0 {
@@ -557,6 +619,7 @@ func (tm *ThreadManager) runOnce(
 			ToolCalls: resp.ToolCalls,
 		}
 		history = append(history, assistantMsg)
+		tm.PublishSiblingContext(threadID, resp.Content)
 
 		// Persist the assistant message.
 		if err := store.AppendToThread(sess.ID, threadID, session.SessionMessage{
@@ -625,36 +688,7 @@ func (tm *ThreadManager) runOnce(
 
 		// Process each tool call.
 		for _, tc := range resp.ToolCalls {
-			// Broadcast tool call event before dispatching.
-			broadcast(sess.ID, "thread_tool_call", map[string]any{
-				"thread_id": threadID,
-				"tool":      tc.Function.Name,
-				"args":      tc.Function.Arguments,
-			})
-
-			switch tc.Function.Name {
-			case "finish":
-				tt.Finish(tc.Function.Arguments)
-				// Finish() panics — execution stops here via defer/recover.
-			case "request_help":
-				tt.RequestHelp(tc.Function.Arguments)
-				// RequestHelp() panics — execution stops here via defer/recover.
-			default:
-				// Dispatch to the wired tool executor (gate-wrapped). Falls back to
-				// "unknown tool" when no executor is set (e.g. in unit tests without
-				// server wiring). Server mode wires the auto-approve executor.
-				var resultContent string
-				if toolExec != nil {
-					result, execErr := toolExec(ctx, tc.Function.Name, tc.Function.Arguments)
-					if execErr != nil {
-						resultContent = fmt.Sprintf("tool error: %v", execErr)
-					} else {
-						resultContent = result
-					}
-				} else {
-					resultContent = fmt.Sprintf("unknown tool: %s", tc.Function.Name)
-				}
-				// Full content goes into LLM history; clipped for persistent store.
+			appendToolResult := func(resultContent string) {
 				history = append(history, backend.Message{
 					Role:       "tool",
 					Content:    resultContent,
@@ -675,6 +709,60 @@ func (tm *ThreadManager) runOnce(
 					"tool":           tc.Function.Name,
 					"result_summary": clipResult(resultContent, 120),
 				})
+			}
+
+			// Broadcast tool call event before dispatching.
+			broadcast(sess.ID, "thread_tool_call", map[string]any{
+				"thread_id": threadID,
+				"tool":      tc.Function.Name,
+				"args":      tc.Function.Arguments,
+			})
+
+			switch tc.Function.Name {
+			case "finish":
+				tt.Finish(tc.Function.Arguments)
+				// Finish() panics — execution stops here via defer/recover.
+			case "request_help":
+				tt.RequestHelp(tc.Function.Arguments)
+				// RequestHelp() panics — execution stops here via defer/recover.
+			case "propose_action":
+				appendToolResult(tt.ProposeAction(tc.Function.Arguments))
+			default:
+				if provider, action, needsApproval := delegatedToolRisk(tc.Function.Name); needsApproval {
+					token, _ := tc.Function.Arguments["_approval_token"].(string)
+					if err := tm.RequireApprovalToken(threadID, token, provider, action); err != nil {
+						appendToolResult("tool error: permission denied: " + err.Error())
+						continue
+					}
+				}
+				// Dispatch to the per-agent runtime executor when available
+				// (gate-wrapped against the agent's session-local registry,
+				// includes MuninnDB and toolbelt providers). Otherwise fall
+				// back to the global gate-wrapped executor for the legacy
+				// path. When neither is set, return "unknown tool" so unit
+				// tests without server wiring still complete deterministically.
+				var resultContent string
+				switch {
+				case runtime != nil && runtime.ExecuteTool != nil:
+					toolCtx := SetCallingAgent(ctx, agentID)
+					result, execErr := runtime.ExecuteTool(toolCtx, tc.Function.Name, tc.Function.Arguments)
+					if execErr != nil {
+						resultContent = fmt.Sprintf("tool error: %v", execErr)
+					} else {
+						resultContent = result
+					}
+				case toolExec != nil:
+					toolCtx := SetCallingAgent(ctx, agentID)
+					result, execErr := toolExec(toolCtx, tc.Function.Name, tc.Function.Arguments)
+					if execErr != nil {
+						resultContent = fmt.Sprintf("tool error: %v", execErr)
+					} else {
+						resultContent = result
+					}
+				default:
+					resultContent = fmt.Sprintf("unknown tool: %s", tc.Function.Name)
+				}
+				appendToolResult(resultContent)
 			}
 		}
 
@@ -804,4 +892,75 @@ func clipResult(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen-3] + "..."
+}
+
+func formatSiblingContextBlock(msgs []ThreadContextMessage) string {
+	var sb strings.Builder
+	sb.WriteString("## Team Context Updates\n")
+	for _, m := range msgs {
+		content := clipResult(m.Content, 140)
+		if content == "" {
+			continue
+		}
+		agent := m.AgentID
+		if agent == "" {
+			agent = "unknown-agent"
+		}
+		sb.WriteString("- ")
+		sb.WriteString(agent)
+		sb.WriteString(": ")
+		sb.WriteString(content)
+		sb.WriteString("\n")
+	}
+	return strings.TrimSpace(sb.String())
+}
+
+var delegatedApprovalProviders = map[string]bool{
+	"aws":           true,
+	"azure":         true,
+	"gcp":           true,
+	"github":        true,
+	"gitlab":        true,
+	"homeassistant": true,
+	"kubernetes":    true,
+	"mysql":         true,
+	"postgres":      true,
+	"sendgrid":      true,
+	"slack":         true,
+}
+
+var lowRiskActionPrefixes = []string{
+	"describe_",
+	"fetch_",
+	"find_",
+	"get_",
+	"head_",
+	"list_",
+	"preview_",
+	"read_",
+	"search_",
+	"show_",
+	"status_",
+}
+
+func delegatedToolRisk(toolName string) (provider, action string, highRisk bool) {
+	toolName = strings.ToLower(strings.TrimSpace(toolName))
+	if toolName == "" {
+		return "", "", false
+	}
+	parts := strings.SplitN(toolName, "_", 2)
+	if len(parts) != 2 {
+		return "", "", false
+	}
+	provider = strings.TrimSpace(parts[0])
+	action = strings.TrimSpace(parts[1])
+	if provider == "" || action == "" || !delegatedApprovalProviders[provider] {
+		return "", "", false
+	}
+	for _, p := range lowRiskActionPrefixes {
+		if strings.HasPrefix(action, p) {
+			return provider, action, false
+		}
+	}
+	return provider, action, true
 }

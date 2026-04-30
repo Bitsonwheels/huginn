@@ -32,6 +32,7 @@ import (
 	"github.com/scrypster/huginn/internal/memory"
 	"github.com/scrypster/huginn/internal/modelconfig"
 	"github.com/scrypster/huginn/internal/pricing"
+	"github.com/scrypster/huginn/internal/proactivity"
 	modelslib "github.com/scrypster/huginn/internal/models"
 	"github.com/scrypster/huginn/internal/notepad"
 	"github.com/scrypster/huginn/internal/permissions"
@@ -453,9 +454,9 @@ func main() {
 	// Wire cloud vault memory replicator — pushes agent memory writes to HuginnCloud
 	// so they persist across sessions and are available from all connected browsers.
 	if sqlDB != nil {
-		tuiMemReplicator := wireMemoryReplicator(sqlDB)
-		tuiMemReplicator.Start()
-		defer tuiMemReplicator.Stop()
+		tuiVaultReplicator := wireCloudVaultReplicator(sqlDB)
+		tuiVaultReplicator.Start()
+		defer tuiVaultReplicator.Stop()
 	}
 
 	// 5. Stats registry
@@ -1157,6 +1158,56 @@ func buildProviders(cfg *config.Config) []connections.IntegrationProvider {
 	return providers
 }
 
+// newLazyMetricsCollector returns a scheduler.MetricsCollector and a binder
+// function. Until the binder is invoked the collector is a no-op; once bound
+// to a *stats.Registry every Record/Histogram call is forwarded. This lets
+// the workflow runner be constructed BEFORE the serve-mode stats.Registry
+// (which depends on a confirmed SQLite database) without reordering the
+// startServer bootstrap. The collector is safe for concurrent use; the
+// underlying *stats.Registry is itself thread-safe.
+func newLazyMetricsCollector() (scheduler.MetricsCollector, func(*stats.Registry)) {
+	var (
+		mu  sync.RWMutex
+		reg *stats.Registry
+	)
+	bind := func(r *stats.Registry) {
+		mu.Lock()
+		reg = r
+		mu.Unlock()
+	}
+	c := &lazyMetricsCollector{
+		read: func() *stats.Registry {
+			mu.RLock()
+			defer mu.RUnlock()
+			return reg
+		},
+	}
+	return c, bind
+}
+
+// lazyMetricsCollector forwards Record/Histogram to the *stats.Registry
+// returned by `read` at call time. When `read` returns nil the call is a
+// no-op so the workflow runner stays cheap before bind happens.
+type lazyMetricsCollector struct {
+	read func() *stats.Registry
+}
+
+func (l *lazyMetricsCollector) Record(metric string, value float64, tags ...string) {
+	r := l.read()
+	if r == nil {
+		return
+	}
+	r.Collector().Record(metric, value, tags...)
+}
+
+func (l *lazyMetricsCollector) Histogram(metric string, value float64, tags ...string) {
+	r := l.read()
+	if r == nil {
+		return
+	}
+	r.Histogram(metric, value, tags...)
+}
+
 // buildCredentialResolver returns a scheduler.CredentialResolver that looks up
 // connection credentials by AccountLabel (or ID). Returns nil if either store
 // is nil so callers can safely pass it to MakeWorkflowRunner.
@@ -1586,13 +1637,13 @@ func cmdRuntime(args []string) error {
 	}
 }
 
-// wireMemoryReplicator creates and configures a MemoryReplicator backed by sqlDB.
+// wireCloudVaultReplicator creates and configures a CloudVaultReplicator backed by sqlDB.
 // If HUGINN_CLOUD_URL is set and the machine is registered with HuginnCloud,
 // the replicator is wired with an HTTPVaultClient so agent memory writes are
 // replicated to the cloud vault. The caller must call Start() and arrange for
 // Stop() to be called on shutdown.
-func wireMemoryReplicator(sqlDB *sqlitedb.DB) *agentslib.MemoryReplicator {
-	mr := agentslib.NewMemoryReplicator(sqlDB)
+func wireCloudVaultReplicator(sqlDB *sqlitedb.DB) *agentslib.CloudVaultReplicator {
+	mr := agentslib.NewCloudVaultReplicator(sqlDB)
 	tokenStore := relay.NewTokenStore()
 	if cloudURL := os.Getenv("HUGINN_CLOUD_URL"); cloudURL != "" && tokenStore.IsRegistered() {
 		mr.WithVaultClient(agentslib.NewHTTPVaultClient(cloudURL, func() string {
@@ -2332,9 +2383,9 @@ func startServer(cfg *config.Config) (srv *server.Server, token string, cleanup 
 	// Wire cloud vault memory replicator — drains cloud_vault_queue and pushes agent
 	// memory writes to HuginnCloud so they persist across sessions and devices.
 	if sqlDB != nil {
-		srvMemReplicator := wireMemoryReplicator(sqlDB)
-		srvMemReplicator.Start()
-		cleanupFns = append(cleanupFns, srvMemReplicator.Stop)
+		srvVaultReplicator := wireCloudVaultReplicator(sqlDB)
+		srvVaultReplicator.Start()
+		cleanupFns = append(cleanupFns, srvVaultReplicator.Stop)
 	}
 
 	// Run one-time Pebble → SQLite migration if SQLite is available.
@@ -2358,6 +2409,11 @@ func startServer(cfg *config.Config) (srv *server.Server, token string, cleanup 
 	srv.SetNotificationStore(notifStore)
 
 	// ── Scheduler ───────────────────────────────────────────────────────
+	// bindWorkflowMetricsRegistry is populated inside the scheduler block so
+	// the workflow runner's metrics emit via the same stats.Registry that
+	// powers the rest of serve mode. It stays nil when the scheduler is
+	// disabled and the bind below becomes a no-op.
+	var bindWorkflowMetricsRegistry func(*stats.Registry)
 	if cfg.SchedulerEnabled {
 		agentFn := func(ctx context.Context, opts scheduler.RunOptions) (string, error) {
 			reg := orch.GetAgentRegistry()
@@ -2368,9 +2424,35 @@ func startServer(cfg *config.Config) (srv *server.Server, token string, cleanup 
 			if !ok {
 				return "", fmt.Errorf("workflow: agent %q not found", opts.AgentName)
 			}
+			// Phase 7: per-step model override. WithModelOverride is a no-op
+			// for empty strings, so the override is opt-in and request-scoped
+			// (the shared registry instance is never mutated).
+			if opts.ModelOverride != "" {
+				ag = ag.WithModelOverride(opts.ModelOverride)
+			}
 			sessionID := "workflow-" + opts.RunID
 			var buf strings.Builder
-			onToken := func(tok string) { buf.WriteString(tok) }
+			// Local accumulator (used as fallback output) AND tee to the
+			// runner-supplied OnToken so the WS streamer sees every chunk.
+			onToken := func(tok string) {
+				buf.WriteString(tok)
+				if opts.OnToken != nil {
+					opts.OnToken(tok)
+				}
+			}
+			// Honour per-step pre-authorised connection picks (Phase 1.4).
+			// Surfaces in ChatWithAgent's system prompt as guidance, and is
+			// readable by future tool layers via agent.StepConnections(ctx).
+			if len(opts.Connections) > 0 {
+				ctx = agent.WithStepConnections(ctx, opts.Connections)
+			}
+			if opts.WorkflowID != "" {
+				mode := agent.ContinuityModeDeterministic
+				if strings.EqualFold(opts.ContinuityMode, agent.ContinuityModeConversational) {
+					mode = agent.ContinuityModeConversational
+				}
+				ctx = agent.WithContinuityMode(ctx, mode)
+			}
 			if err := orch.ChatWithAgent(ctx, ag, opts.Prompt, sessionID, onToken, nil, nil); err != nil {
 				return "", fmt.Errorf("workflow: agent execution: %w", err)
 			}
@@ -2382,21 +2464,29 @@ func startServer(cfg *config.Config) (srv *server.Server, token string, cleanup 
 		}
 
 		sched := scheduler.New()
-		sched.Start()
-		cleanupFns = append(cleanupFns, func() { sched.Stop(context.Background()) })
-		srv.SetScheduler(sched)
-
 		// Workflows
 		workflowsDir := filepath.Join(huginnHome, "workflows")
 		if err := os.MkdirAll(workflowsDir, 0755); err != nil {
 			logger.Warn("huginn: create workflows dir", "err", err)
 		}
+		sched.SetWorkflowsDir(workflowsDir)
+		sched.Start(context.Background())
+		cleanupFns = append(cleanupFns, func() { sched.Stop(context.Background()) })
+		srv.SetScheduler(sched)
 		workflowRunsDir := filepath.Join(huginnHome, "workflow-runs")
 
 		// Run one-time routine → workflow migration.
 		routinesDir := filepath.Join(huginnHome, "routines")
 		if err := scheduler.MigrateRoutinesToWorkflows(routinesDir, workflowsDir); err != nil {
 			logger.Warn("huginn: migrate routines to workflows", "err", err)
+		}
+		// Repair any workflows from a buggy prior migration that left
+		// {Routine: slug} steps that the runner rejects. Idempotent.
+		routinesBakDir := routinesDir + ".bak"
+		if repaired, err := scheduler.RepairLegacyRoutineSteps(workflowsDir, routinesBakDir); err != nil {
+			logger.Warn("huginn: repair legacy routine steps", "err", err)
+		} else if repaired > 0 {
+			logger.Info("huginn: repaired legacy routine steps", "count", repaired)
 		}
 
 		// Apply scheduler schema migrations (e.g. workflow_runs CHECK constraint update).
@@ -2426,6 +2516,31 @@ func startServer(cfg *config.Config) (srv *server.Server, token string, cleanup 
 		srv.SetWorkflowRunStore(workflowRunStore)
 
 		wfDeliverers := scheduler.NewDelivererRegistry(buildCredentialResolver(connStore, connSecrets))
+
+		// Delivery queue (requires SQLite; falls back to nil = legacy JSONL mode).
+		var deliveryQueue *scheduler.DeliveryQueue
+		if sqlDB != nil {
+			dqStore := scheduler.NewDeliveryQueueStore(sqlDB)
+			if err := scheduler.MigrateDeadLetterToQueue(huginnHome, dqStore); err != nil {
+				logger.Warn("huginn: dead-letter migration", "err", err)
+			}
+			deliveryQueue = scheduler.NewDeliveryQueue(dqStore, wfDeliverers, notifStore,
+				func(eventType string, payload map[string]any) {
+					srv.BroadcastWS(server.WSMessage{Type: eventType, Payload: payload})
+				})
+			sched.SetDeliveryQueue(deliveryQueue)
+			srv.SetDeliveryQueue(deliveryQueue)
+		}
+
+		// Lazy metrics indirection: the stats.Registry for serve mode is
+		// created later (just before srv.Start) once sqlDB is confirmed and
+		// the persister is wired. We hand the workflow runner a collector
+		// that resolves at emission time so the runner records to the same
+		// registry the rest of the server uses without us having to reorder
+		// startServer's bootstrap.
+		workflowMetricsCollector, binder := newLazyMetricsCollector()
+		bindWorkflowMetricsRegistry = binder
+		heartbeatPolicy := proactivity.NewPolicy(proactivity.Config{})
 		wfRunner := scheduler.MakeWorkflowRunner(
 			workflowRunStore,
 			agentFn,
@@ -2483,8 +2598,122 @@ func startServer(cfg *config.Config) (srv *server.Server, token string, cleanup 
 					},
 				})
 			},
+			// Phase 3: agent DM delivery. The runtime binding broadcasts an
+			// agent_dm_notification WS event so the live UI surfaces it; the
+			// full message-persistence path lives in the spaces subsystem and
+			// is engaged on demand by the frontend.
+			scheduler.WithAgentDMDelivery(func(agentName, user, summary, detail string) error {
+				srv.BroadcastWS(server.WSMessage{
+					Type: "agent_dm_notification",
+					Payload: map[string]any{
+						"agent":   agentName,
+						"user":    user,
+						"summary": summary,
+						"detail":  detail,
+					},
+				})
+				return nil
+			}),
+			// Proactivity policy core (Workstream 3 / PR-3.1): heartbeat-style
+			// proactive DMs are budgeted per agent+DM, screened by relevance, and
+			// rate-limited by cooldown to avoid noisy check-ins.
+			scheduler.WithProactivityGate(func(_ context.Context, req scheduler.ProactivityGateRequest) (bool, string) {
+				return proactivity.EvaluateHeartbeatDeliveryGate(heartbeatPolicy, proactivity.DeliveryGateRequest{
+					WorkflowID: req.WorkflowID,
+					Schedule:   req.Schedule,
+					AgentName:  req.AgentName,
+					User:       req.User,
+					Summary:    req.Summary,
+					Detail:     req.Detail,
+					CreatedAt:  req.CreatedAt,
+				})
+			}),
+			// Phase 5: workflow chaining. After a parent workflow run reaches
+			// a terminal status, optionally trigger a downstream workflow.
+			// The downstream run's scratchpad is seeded with the parent run's
+			// final output so a "fan-in" pipeline can read
+			// {{run.scratch.upstream_output}} on its first step. We reload
+			// workflows from disk for the lookup so YAML edits to chains
+			// take effect without a server restart.
+			scheduler.WithChainTrigger(func(parent *scheduler.Workflow, run *scheduler.WorkflowRun) {
+				if parent == nil || parent.Chain == nil || strings.TrimSpace(parent.Chain.Next) == "" {
+					return
+				}
+				success := run.Status == scheduler.WorkflowRunStatusComplete
+				failure := run.Status == scheduler.WorkflowRunStatusFailed || run.Status == scheduler.WorkflowRunStatusPartial
+				want := (parent.Chain.OnSuccess && success) || (parent.Chain.OnFailure && failure)
+				// Default-on for success when neither flag is set so a
+				// workflow with `chain: { next: foo }` chains on completion
+				// without requiring on_success: true boilerplate.
+				if !parent.Chain.OnSuccess && !parent.Chain.OnFailure && success {
+					want = true
+				}
+				if !want {
+					return
+				}
+				wfs, err := scheduler.LoadWorkflows(workflowsDir)
+				if err != nil {
+					logger.Warn("scheduler: chain trigger — load workflows failed", "err", err)
+					return
+				}
+				var next *scheduler.Workflow
+				for _, wf := range wfs {
+					if wf.ID == parent.Chain.Next {
+						next = wf
+						break
+					}
+				}
+				if next == nil {
+					logger.Warn("scheduler: chain trigger — next workflow not found", "parent", parent.ID, "next", parent.Chain.Next)
+					return
+				}
+				inputs := map[string]string{
+					"upstream_workflow_id": parent.ID,
+					"upstream_run_id":      run.ID,
+					"upstream_status":      string(run.Status),
+				}
+				if len(run.Steps) > 0 {
+					inputs["upstream_output"] = run.Steps[len(run.Steps)-1].Output
+				}
+				if err := sched.TriggerWorkflowWithInputs(context.Background(), next, inputs); err != nil {
+					logger.Warn("scheduler: chain trigger failed", "parent", parent.ID, "next", next.ID, "err", err)
+				}
+			}),
+			// Phase 8: sub-workflow resolver. The runner calls this when a
+			// step has `sub_workflow: <id>`. We reload workflows from disk
+			// (so YAML edits take effect without restart), trigger the
+			// child synchronously with the parent's scratchpad as initial
+			// inputs, and return the child's last-step output. Errors
+			// abort the parent step like an agent failure would.
+			scheduler.WithMetricsCollector(workflowMetricsCollector),
+			scheduler.WithSubWorkflow(func(ctx context.Context, id string, inputs map[string]string) (string, error) {
+				wfs, err := scheduler.LoadWorkflows(workflowsDir)
+				if err != nil {
+					return "", fmt.Errorf("load workflows: %w", err)
+				}
+				var child *scheduler.Workflow
+				for _, wf := range wfs {
+					if wf.ID == id {
+						child = wf
+						break
+					}
+				}
+				if child == nil {
+					return "", fmt.Errorf("sub-workflow %q not found", id)
+				}
+				run, err := sched.RunWorkflowSyncWithInputs(ctx, child, inputs)
+				if err != nil {
+					return "", err
+				}
+				if run == nil || len(run.Steps) == 0 {
+					return "", nil
+				}
+				return run.Steps[len(run.Steps)-1].Output, nil
+			}),
+			scheduler.WithDeliveryQueue(deliveryQueue),
 		)
 		sched.SetWorkflowRunner(wfRunner)
+		sched.SetWorkflowRunStore(workflowRunStore)
 		if err := sched.LoadWorkflows(workflowsDir); err != nil {
 			logger.Warn("huginn: load workflows", "err", err)
 		}
@@ -2571,6 +2800,27 @@ func startServer(cfg *config.Config) (srv *server.Server, token string, cleanup 
 					return threadmgr.DelegateResult{Err: createErr}
 				}
 				logger.Info("delegate_to_agent: thread created", "thread_id", t.ID, "agent", p.AgentName)
+
+				// Record the delegation so delegation_chain is populated for panel-open hydration.
+				fromAgent := threadmgr.GetCallingAgent(ctx)
+				if fromAgent == "" {
+					logger.Warn("delegate_to_agent: calling agent not set on context; delegation record skipped",
+						"to", p.AgentName, "session", sessionID, "thread", t.ID)
+				} else {
+					rec := session.DelegationRecord{
+						ID:        session.NewID(),
+						SessionID: sessionID,
+						ThreadID:  t.ID,
+						FromAgent: fromAgent,
+						ToAgent:   p.AgentName,
+						Task:      p.Task,
+						Status:    "pending",
+					}
+					if err := srv.InsertDelegation(rec); err != nil {
+						logger.Warn("delegate_to_agent: failed to insert delegation record",
+							"err", err, "from", fromAgent, "to", p.AgentName)
+					}
+				}
 
 				tm.ResolveDependencies(t.ID)
 				logger.Info("delegate_to_agent: dependencies resolved", "thread_id", t.ID, "ready", tm.IsReady(t.ID))
@@ -2662,8 +2912,44 @@ func startServer(cfg *config.Config) (srv *server.Server, token string, cleanup 
 			"recall_thread_result",
 		}, "builtin")
 
+		// ── Workflow runtime parity (Phase 1) ─────────────────────────────
+		// Bring the server's tool registry up to TUI-mode parity so scheduled
+		// workflows (and interactive web chats) get the full toolbelt: OAuth
+		// integration tools, external MCP server tools, and skill PromptTools.
+		// Order matters: connection tools and MCP tools BEFORE orch.SetTools so
+		// applyToolbelt sees them when filtering per-agent schemas.
+		initConnectionTools(*cfg, huginnHome, sqlDB, toolReg)
+		var mcpMgr *mcp.ServerManager
+		if len(cfg.MCPServers) > 0 {
+			mcpMgr = mcp.NewServerManager(cfg.MCPServers)
+			mcpMgr.StartAll(context.Background(), toolReg)
+			cleanupFns = append(cleanupFns, func() { mcpMgr.StopAll(context.Background()) })
+			logger.Info("huginn: MCP servers started for server mode", "count", len(cfg.MCPServers))
+		}
+
 		// Auto-approve all tools in server mode — reuse the gate created above.
 		orch.SetTools(toolReg, serverGate)
+
+		// Wire orchestrator state needed for tool execution + system prompts.
+		// Set git root and huginn home so context builder, agent memory, and
+		// skill workspace-rule loaders work correctly. Best-effort: missing
+		// values degrade specific features but never block boot.
+		orch.SetGitRoot(srvCWD)
+		orch.SetHuginnHome(huginnHome)
+		// Wire agent memory store so cross-session summaries and recall work.
+		// Mirrors lines ~440-451 in TUI mode but scoped to server mode.
+		var srvMemStore agentslib.MemoryStoreIface
+		if sqlDB != nil {
+			srvMemStore = agentslib.NewSQLiteMemoryStore(sqlDB.Write(), relay.GetMachineID())
+		}
+		if srvMemStore != nil {
+			orch.SetMemoryStore(srvMemStore)
+		}
+
+		// Bootstrap skills onto both the orchestrator's skills registry AND the
+		// active tool registry (PromptTools). reloadSkills is idempotent so any
+		// later CRUD mutation re-applies cleanly without restart.
+		srv.BootstrapSkills()
 
 		// Also wire the mention-based delegation path so @AgentName in chat
 		// spawns threads even when the primary model doesn't support tool calls.
@@ -2886,6 +3172,17 @@ func startServer(cfg *config.Config) (srv *server.Server, token string, cleanup 
 		tm.SetToolExecutor(func(ctx context.Context, name string, args map[string]any) (string, error) {
 			return toolReg.Execute(ctx, name, args)
 		})
+
+		// Per-agent runtime preparer: gives every spawned worker thread
+		// the same vault-aware toolbelt + memory_mode prompt that the
+		// orchestrator uses for primary chat. Without this hook, delegated
+		// agents (Sam, Stacy, etc. invoked via @mention) inherit only the
+		// global tool list — no muninn_* tools, no MCP connections, no
+		// memory_mode instructions — and run effectively stateless. The
+		// orchestrator owns vault connection, registry forking, gate
+		// forking, and session env setup; threadmgr just consumes the
+		// resulting AgentRuntime.
+		tm.SetAgentRuntimePreparer(orch.PrepareAgentRuntime)
 	}
 
 	// Wire relay config if HuginnCloud is configured.
@@ -2919,12 +3216,45 @@ func startServer(cfg *config.Config) (srv *server.Server, token string, cleanup 
 	muninnCfgFilePath := filepath.Join(home, ".config", "huginn", "muninn.json")
 	srv.SetMuninnConfigPath(muninnCfgFilePath)
 	orch.SetMuninnConfigPath(muninnCfgFilePath)
+	if sqlDB != nil {
+		// Channel memory fan-out replicator (Muninn -> teammate vaults).
+		// Uses the same SQLite DB for durable retry queueing.
+		channelMemReplicator := agent.NewMemoryReplicator(
+			muninnCfgFilePath,
+			agent.NewSQLiteReplicationQueuer(sqlDB),
+		)
+		orch.SetMemoryReplicator(channelMemReplicator)
+		repCtx, repCancel := context.WithCancel(context.Background())
+		go channelMemReplicator.Start(repCtx)
+		cleanupFns = append(cleanupFns, func() {
+			repCancel()
+			channelMemReplicator.Stop()
+		})
+	}
+
+	// Surface the build-time version (set via -ldflags="-X main.version=...")
+	// to /api/v1/health so the frontend can render it in the H-logo tooltip,
+	// the profile popover footer, and Settings → About.
+	srv.SetVersion(version)
 
 	ctx := context.Background()
 	if err := srv.Start(ctx); err != nil {
 		return nil, "", nil, fmt.Errorf("server start: %w", err)
 	}
 	orch.StartSessionCleanup(ctx)
+
+	// Wire the cross-channel memory replicator. Fans out muninn writes from one
+	// channel member to all other members' vaults in the same space.
+	// The SQLite queue provides durability across restarts.
+	if sqlDB != nil {
+		crossChannelReplicator := agent.NewMemoryReplicator(
+			muninnCfgFilePath,
+			agent.NewSQLiteReplicationQueuer(sqlDB),
+		)
+		orch.SetMemoryReplicator(crossChannelReplicator)
+		go crossChannelReplicator.Start(ctx)
+		cleanupFns = append(cleanupFns, crossChannelReplicator.Stop)
+	}
 
 	// Now that we know the real address, update the OAuth callback URL.
 	if connMgr != nil {
@@ -2937,6 +3267,12 @@ func startServer(cfg *config.Config) (srv *server.Server, token string, cleanup 
 	if sqlDB != nil {
 		serveReg := stats.NewRegistry()
 		srv.SetStatsRegistry(serveReg)
+		// Phase 4/observability: connect the workflow runner's lazy metrics
+		// collector to the live registry so workflow run/step metrics flow
+		// through the same persister as the rest of serve-mode metrics.
+		if bindWorkflowMetricsRegistry != nil {
+			bindWorkflowMetricsRegistry(serveReg)
+		}
 		servePersister = stats.NewPersister(sqlDB, serveReg)
 		srv.SetStatsPersister(servePersister)
 		// Forward CostAccumulator events to the persister for SQLite storage.

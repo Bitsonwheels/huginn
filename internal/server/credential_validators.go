@@ -3,16 +3,47 @@ package server
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/scrypster/huginn/internal/connections/catalog"
 	"github.com/scrypster/huginn/internal/memory"
 )
+
+// sendgridScopesURL is the endpoint used to validate SendGrid API keys.
+// Overridable in tests.
+var sendgridScopesURL = "https://api.sendgrid.com/v3/scopes"
+
+// sendgridHTTPClient overrides the HTTP client for testing only.
+// In production this is nil and validateSendGridCredentials falls back to
+// safeHTTPClient(). Tests set this to http.DefaultClient so that requests
+// reach the loopback httptest.Server without being blocked by the SSRF dialer.
+var sendgridHTTPClient *http.Client // test-only override
+
+// weatherValidationURL is the OpenWeatherMap endpoint used to validate API keys.
+// Overridable in tests.
+var weatherValidationURL = "https://api.openweathermap.org/data/2.5/weather"
+
+// weatherHTTPClient overrides the HTTP client for testing only.
+// In production this is nil and validateWeatherCredentials falls back to
+// safeHTTPClient(). Tests set this to http.DefaultClient so that requests
+// reach the loopback httptest.Server without being blocked by the SSRF dialer.
+var weatherHTTPClient *http.Client // test-only override
+// todoistValidationURL is the endpoint used to validate Todoist API tokens.
+// Overridable in tests.
+var todoistValidationURL = "https://api.todoist.com/rest/v2/projects"
+
+// todoistHTTPClient overrides the HTTP client for testing only.
+// In production this is nil and validateTodoistCredentials falls back to
+// safeHTTPClient(). Tests set this to http.DefaultClient so that requests
+// reach the loopback httptest.Server without being blocked by the SSRF dialer.
+var todoistHTTPClient *http.Client // test-only override
 
 // buildCredentialValidatorRegistry constructs the process-wide registry that
 // maps catalog provider IDs to their connectivity validators.
@@ -35,6 +66,20 @@ func buildCredentialValidatorRegistry() *catalog.Registry {
 
 	r.Register("discord", catalog.ValidatorFunc(func(ctx context.Context, f map[string]string) error {
 		return validateDiscordCredentials(ctx, f["bot_token"])
+	}))
+
+	r.Register("sendgrid", catalog.ValidatorFunc(func(ctx context.Context, f map[string]string) error {
+		return validateSendGridCredentials(ctx, f["api_key"])
+	}))
+
+	// ── Personal ──────────────────────────────────────────────────────────────
+
+	r.Register("weather", catalog.ValidatorFunc(func(ctx context.Context, f map[string]string) error {
+		return validateWeatherCredentials(ctx, f["api_key"])
+	}))
+
+	r.Register("homeassistant", catalog.ValidatorFunc(func(ctx context.Context, f map[string]string) error {
+		return validateHomeAssistantCredentials(ctx, f["base_url"], f["token"])
 	}))
 
 	// ── Observability ─────────────────────────────────────────────────────────
@@ -123,6 +168,10 @@ func buildCredentialValidatorRegistry() *catalog.Registry {
 
 	r.Register("stripe", catalog.ValidatorFunc(func(ctx context.Context, f map[string]string) error {
 		return validateStripeCredentials(ctx, f["api_key"])
+	}))
+
+	r.Register("todoist", catalog.ValidatorFunc(func(ctx context.Context, f map[string]string) error {
+		return validateTodoistCredentials(ctx, f["api_key"])
 	}))
 
 	// ── Database ──────────────────────────────────────────────────────────────
@@ -690,6 +739,33 @@ func validateStripeCredentials(ctx context.Context, apiKey string) error {
 	return nil
 }
 
+func validateSendGridCredentials(ctx context.Context, apiKey string) error {
+	if apiKey == "" {
+		return errors.New("api_key is required")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sendgridScopesURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	client := sendgridHTTPClient
+	if client == nil {
+		client = safeHTTPClient()
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("sendgrid: validation request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == 401 || resp.StatusCode == 403 {
+		return errors.New("invalid API key")
+	}
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("sendgrid: validation returned %d", resp.StatusCode)
+	}
+	return nil
+}
+
 // validateMuninnCredentials verifies MuninnDB credentials by attempting a login.
 // It uses the plain MuninnSetupClient (no SSRF filter) since MuninnDB is
 // expected to run on localhost or a trusted internal network.
@@ -700,6 +776,91 @@ func validateMuninnCredentials(ctx context.Context, endpoint, username, password
 	_, err := memory.NewMuninnSetupClient(endpoint).Login(username, password)
 	if err != nil {
 		return fmt.Errorf("muninn: login failed: %w", err)
+	}
+	return nil
+}
+
+func validateHomeAssistantCredentials(ctx context.Context, baseURL, token string) error {
+	if token == "" {
+		return errors.New("token is required")
+	}
+	if baseURL == "" {
+		baseURL = "http://homeassistant.local:8123"
+	}
+	baseURL = strings.TrimRight(baseURL, "/")
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/api/", nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("homeassistant: validation request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return errors.New("invalid token or cannot reach Home Assistant")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("homeassistant: validation returned %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func validateWeatherCredentials(ctx context.Context, apiKey string) error {
+	if apiKey == "" {
+		return errors.New("api_key is required")
+	}
+	reqURL := fmt.Sprintf("%s?q=London&appid=%s", weatherValidationURL, apiKey)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return err
+	}
+	client := weatherHTTPClient
+	if client == nil {
+		client = safeHTTPClient()
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("weather: validation request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusNotFound {
+		return errors.New("invalid API key")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("weather: validation returned %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func validateTodoistCredentials(ctx context.Context, apiKey string) error {
+	if apiKey == "" {
+		return errors.New("api_key is required")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, todoistValidationURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	var client *http.Client
+	if todoistHTTPClient != nil {
+		client = todoistHTTPClient
+	} else {
+		client = safeHTTPClient()
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("todoist: validation request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return errors.New("invalid API token")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("todoist: validation returned %d", resp.StatusCode)
 	}
 	return nil
 }

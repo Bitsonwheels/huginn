@@ -27,3 +27,35 @@ func TestThreadManager_SetCompletionNotifier(t *testing.T) {
 		t.Fatal("SetCompletionNotifier did not set the notifier")
 	}
 }
+
+func TestThreadManager_SetThreadBus(t *testing.T) {
+	tm := New()
+	if tm.threadBus == nil {
+		t.Fatal("expected default threadBus on new ThreadManager")
+	}
+	bus := NewThreadBus(4)
+	tm.SetThreadBus(bus)
+	if tm.threadBus != bus {
+		t.Fatal("SetThreadBus did not set bus")
+	}
+	tm.SetThreadBus(nil)
+	if tm.threadBus != nil {
+		t.Fatal("SetThreadBus(nil) should disable bus")
+	}
+}
+
+func TestThreadManager_SetProposalRegistry(t *testing.T) {
+	tm := New()
+	if tm.proposalRegistry == nil {
+		t.Fatal("expected default proposalRegistry on new ThreadManager")
+	}
+	reg := NewProposalRegistry()
+	tm.SetProposalRegistry(reg)
+	if tm.proposalRegistry != reg {
+		t.Fatal("SetProposalRegistry did not set registry")
+	}
+	tm.SetProposalRegistry(nil)
+	if tm.proposalRegistry != nil {
+		t.Fatal("SetProposalRegistry(nil) should disable registry")
+	}
+}

@@ -17,7 +17,7 @@
     <nav class="w-12 flex-shrink-0 flex flex-col items-center py-3 gap-1 border-r border-huginn-border" style="background:#090e14">
 
       <!-- Logo mark -->
-      <div class="w-8 h-8 rounded-xl flex items-center justify-center mb-3 select-none cursor-default"
+      <div class="w-8 h-8 rounded-xl flex items-center justify-center mb-3 select-none"
         style="background:linear-gradient(135deg,rgba(88,166,255,0.2),rgba(88,166,255,0.05));border:1px solid rgba(88,166,255,0.3)">
         <span class="text-huginn-blue font-bold text-sm leading-none">H</span>
       </div>
@@ -47,6 +47,13 @@
         <span v-if="item.section === 'chat' && chatDoneCount > 0"
           class="absolute -top-0.5 -right-0.5 w-3.5 h-3.5 rounded-full bg-huginn-red text-white text-[8px] font-bold flex items-center justify-center leading-none">
           {{ chatDoneCount > 9 ? '9+' : chatDoneCount }}
+        </span>
+
+        <!-- Badge overlay for automation (delivery issues) -->
+        <span v-if="item.section === 'automation' && hasIssues"
+          class="absolute -top-0.5 -right-0.5 w-3.5 h-3.5 rounded-full bg-huginn-red text-white text-[8px] font-bold flex items-center justify-center leading-none"
+          @click.stop="drawerOpen = true">
+          {{ badgeCount > 9 ? '9+' : badgeCount }}
         </span>
 
         <!-- Icon -->
@@ -84,6 +91,11 @@
             <line x1="18" y1="20" x2="18" y2="10" />
             <line x1="12" y1="20" x2="12" y2="4" />
             <line x1="6" y1="20" x2="6" y2="14" />
+          </g>
+          <!-- Memory icon (database/vault) -->
+          <g v-else-if="item.icon === 'memory'">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+              d="M9 3H7a2 2 0 00-2 2v1a3 3 0 000 6v1a2 2 0 002 2h2m6 0h2a2 2 0 002-2v-1a3 3 0 000-6V5a2 2 0 00-2-2h-2M9 3v18M15 3v18M9 9h6M9 15h6" />
           </g>
           <!-- Inbox icon (bell) -->
           <g v-else-if="item.icon === 'inbox'">
@@ -165,6 +177,13 @@
             <span class="text-[11px] text-huginn-muted">
               Local server {{ wsConnected ? 'reachable' : 'unreachable' }}
             </span>
+          </div>
+
+          <!-- Build version footer — small, muted, just for update confirmation -->
+          <div class="px-4 pb-2.5 pt-0.5 flex items-center justify-between text-[10px] text-huginn-muted/60"
+            data-testid="popover-version-row">
+            <span class="uppercase tracking-wider">Version</span>
+            <span class="font-mono">{{ versionLabel }}</span>
           </div>
         </div>
       </div>
@@ -751,6 +770,51 @@
 
       <RouterView v-else />
     </main>
+
+    <!-- Delivery issues drawer -->
+    <Transition name="slide-right">
+      <div v-if="drawerOpen"
+        class="fixed right-0 top-0 h-full w-80 bg-huginn-bg border-l border-huginn-border z-50 flex flex-col shadow-xl">
+        <div class="flex items-center justify-between p-4 border-b border-huginn-border">
+          <span class="text-sm font-semibold text-huginn-text">Delivery Issues</span>
+          <button @click="drawerOpen = false" class="text-huginn-muted hover:text-huginn-text">✕</button>
+        </div>
+        <div class="flex-1 overflow-y-auto p-3 flex flex-col gap-2">
+          <div v-if="actionableEntries.length === 0"
+            class="text-huginn-muted text-xs text-center py-8">
+            No delivery issues
+          </div>
+          <div v-for="entry in actionableEntries" :key="entry.id"
+            class="bg-huginn-surface rounded-lg p-3 border border-huginn-border text-xs">
+            <div class="text-huginn-muted mb-1 truncate">{{ entry.workflow_id }}</div>
+            <div class="font-medium text-huginn-text truncate mb-1">{{ entry.endpoint }}</div>
+            <div class="text-huginn-red mb-2">Failed after {{ entry.attempt_count }} attempts</div>
+            <div v-if="entry.last_error" class="text-huginn-muted truncate mb-2">{{ entry.last_error }}</div>
+            <div class="flex gap-2">
+              <button @click="retryEntry(entry.id)"
+                class="flex-1 py-1 bg-huginn-blue/20 text-huginn-blue rounded hover:bg-huginn-blue/30">
+                Retry
+              </button>
+              <button @click="dismissEntry(entry.id)"
+                class="px-2 py-1 text-huginn-muted hover:text-huginn-text rounded border border-huginn-border">
+                Dismiss
+              </button>
+            </div>
+          </div>
+        </div>
+        <div class="p-3 border-t border-huginn-border">
+          <button @click="fetchActionable()"
+            class="w-full text-xs text-huginn-muted hover:text-huginn-text">
+            Refresh
+          </button>
+        </div>
+      </div>
+    </Transition>
+
+    <!-- Drawer backdrop -->
+    <div v-if="drawerOpen"
+      class="fixed inset-0 z-40 bg-black/20"
+      @click="drawerOpen = false" />
   </div>
 </template>
 
@@ -764,6 +828,7 @@ import { useNotifications } from './composables/useNotifications'
 import { useWorkflows } from './composables/useWorkflows'
 import { wireThreadDetailWS } from './composables/useThreadDetail'
 import { useCloud } from './composables/useCloud'
+import { useVersion } from './composables/useVersion'
 import { useSpaces, wireSpaceWS } from './composables/useSpaces'
 import { wireSpaceTimelineWS, getSpaceLastMessage, getSessionSpaceId } from './composables/useSpaceTimeline'
 import { pruneOrphanedUnseenIds } from './composables/unseenSessions'
@@ -771,18 +836,26 @@ import { wireSwarmWS } from './composables/useSwarmStatus'
 import SpaceCreateModal from './components/SpaceCreateModal.vue'
 import { useAgents } from './composables/useAgents'
 import { useThreads } from './composables/useThreads'
+import { useDeliveryQueue } from './composables/useDeliveryQueue'
 
 const route = useRoute()
 const router = useRouter()
 const { sessions, fetchSessions, createSession, formatSessionLabel, getMessages } = useSessions()
 const { notifications, pendingCount, fetchSummary, fetchNotifications, wireWS } = useNotifications()
+const { wireWS: wireWorkflowsWS } = useWorkflows()
 const { isAgentActive } = useThreads()
+const { badgeCount, actionableEntries, hasIssues, fetchBadge, fetchActionable, retryEntry, dismissEntry, handleBadgeUpdate } = useDeliveryQueue()
+
+const drawerOpen = ref(false)
+watch(drawerOpen, (open) => {
+  if (open) fetchActionable()
+})
 
 // ── Nav structure ────────────────────────────────────────────────────
 const navItems = [
-  { section: 'inbox',      label: 'Inbox',      path: '/inbox',      icon: 'inbox'      },
   { section: 'chat',       label: 'Chat',       path: '/chat',       icon: 'chat'       },
   { section: 'agents',     label: 'Agents',     path: '/agents',     icon: 'agents'     },
+  { section: 'memory',     label: 'Memory',     path: '/memory',     icon: 'memory'     },
   { section: 'models',     label: 'Models',     path: '/models',     icon: 'models'     },
   { section: 'automation', label: 'Automation', path: '/workflows',  icon: 'automation' },
   { section: 'connections',label: 'Connections',path: '/connections', icon: 'connections'},
@@ -790,6 +863,7 @@ const navItems = [
   { section: 'stats',      label: 'Stats',      path: '/stats',      icon: 'stats'      },
   { section: 'settings',   label: 'Settings',   path: '/settings',   icon: 'settings'   },
   { section: 'logs',       label: 'Logs',       path: '/logs',       icon: 'logs'       },
+  { section: 'inbox',      label: 'Activity Log', path: '/inbox',      icon: 'inbox'      },
 ]
 
 const activeSection    = computed(() => {
@@ -1009,6 +1083,7 @@ async function initApp() {
     fetchAgents().catch(() => {})
     fetchCloudStatus().catch(() => {})
     wireWS(ws)
+    wireWorkflowsWS(ws)
     wireThreadDetailWS(ws)
     wireSpaceWS(ws)
     wireSpaceTimelineWS(ws)
@@ -1035,6 +1110,9 @@ async function initApp() {
         if (!isViewing) markUnseen(msg.session_id)
       }
     })
+    ws.on('delivery_badge_update', (msg) => {
+      handleBadgeUpdate((msg as unknown as { count: number }).count ?? 0)
+    })
   } catch (e: unknown) {
     appError.value = e instanceof Error ? e.message : 'Failed to initialize'
     appLoading.value = false
@@ -1055,6 +1133,11 @@ const {
 } = useCloud()
 
 const cloudConnected = computed(() => cloudStatus.value.connected)
+
+// Build version surfaced in three places: the H-logo tooltip, the profile
+// popover footer, and Settings → About. The composable caches across the
+// app lifetime so all three render the same value with one network call.
+const { versionLabel, loadVersion } = useVersion()
 
 // ── Spaces ───────────────────────────────────────────────────────────
 const {
@@ -1265,6 +1348,10 @@ function handleGlobalAppKeydown(e: KeyboardEvent) {
 
 onMounted(() => {
   initApp()
+  fetchBadge()
+  // Fire-and-forget: the version is purely informational, no UI flow gates
+  // on its arrival, and useVersion swallows errors gracefully.
+  void loadVersion()
   document.addEventListener('click', onDocClick, true)
   document.addEventListener('keydown', handleGlobalAppKeydown)
 })
@@ -1274,3 +1361,14 @@ onUnmounted(() => {
   document.removeEventListener('keydown', handleGlobalAppKeydown)
 })
 </script>
+
+<style>
+.slide-right-enter-active,
+.slide-right-leave-active {
+  transition: transform 0.2s ease;
+}
+.slide-right-enter-from,
+.slide-right-leave-to {
+  transform: translateX(100%);
+}
+</style>

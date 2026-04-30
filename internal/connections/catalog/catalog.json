@@ -656,6 +656,90 @@
     }
   },
   {
+    "id": "sendgrid",
+    "name": "SendGrid",
+    "description": "Transactional email via SendGrid API v3. Used by agents to send email notifications and reports.",
+    "category": "communication",
+    "icon": "SG",
+    "icon_color": "#1a82e2",
+    "type": "credentials",
+    "default_label": "SendGrid",
+    "multi_account": false,
+    "fields": [
+      {
+        "key": "api_key",
+        "label": "API Key",
+        "type": "password",
+        "required": true,
+        "stored_in": "creds",
+        "placeholder": "SG.xxxxxxxxxxxxxxxxxxxxxxxx",
+        "help_text": "Create a key with 'Mail Send' permission at app.sendgrid.com → Settings → API Keys."
+      },
+      {
+        "key": "from",
+        "label": "From address",
+        "type": "email",
+        "required": true,
+        "stored_in": "metadata",
+        "placeholder": "agent@example.com",
+        "help_text": "Must be a verified sender in your SendGrid account."
+      },
+      {
+        "key": "from_name",
+        "label": "From name",
+        "type": "text",
+        "required": false,
+        "stored_in": "metadata",
+        "placeholder": "Huginn",
+        "help_text": "Display name shown in the recipient's email client."
+      }
+    ],
+    "validation": {
+      "available": true,
+      "description": "Sends a test API call to verify the key is valid and has Mail Send permission."
+    }
+  },
+  {
+    "id": "weather",
+    "name": "OpenWeatherMap",
+    "description": "Current weather and forecasts for any city worldwide",
+    "category": "personal",
+    "icon": "WX",
+    "icon_color": "#e96e0f",
+    "type": "credentials",
+    "default_label": "OpenWeatherMap",
+    "multi_account": false,
+    "fields": [
+      {
+        "key": "api_key",
+        "label": "API Key",
+        "type": "password",
+        "required": true,
+        "stored_in": "creds",
+        "placeholder": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "help_text": "Free API key from openweathermap.org/api"
+      },
+      {
+        "key": "units",
+        "label": "Units",
+        "type": "select",
+        "required": false,
+        "stored_in": "metadata",
+        "default": "metric",
+        "options": [
+          {"label": "Metric (°C, m/s)", "value": "metric"},
+          {"label": "Imperial (°F, mph)", "value": "imperial"},
+          {"label": "Standard (K, m/s)", "value": "standard"}
+        ],
+        "help_text": "Unit system for temperature and wind speed"
+      }
+    ],
+    "validation": {
+      "available": true,
+      "description": "Calls current weather for London to verify the API key."
+    }
+  },
+  {
     "id": "vercel",
     "name": "Vercel",
     "description": "Deployments, domains, environment variables",
@@ -886,5 +970,66 @@
     "multi_account": false,
     "fields": [],
     "validation": { "available": false }
+  },
+  {
+    "id": "homeassistant",
+    "name": "Home Assistant",
+    "description": "Smart home control — lights, switches, scenes, devices",
+    "category": "personal",
+    "icon": "HA",
+    "icon_color": "#18bcf2",
+    "type": "credentials",
+    "default_label": "Home Assistant",
+    "multi_account": false,
+    "fields": [
+      {
+        "key": "base_url",
+        "label": "Base URL",
+        "type": "url",
+        "required": true,
+        "stored_in": "metadata",
+        "placeholder": "http://homeassistant.local:8123",
+        "help_text": "URL of your Home Assistant instance (e.g. http://192.168.1.10:8123)"
+      },
+      {
+        "key": "token",
+        "label": "Long-Lived Access Token",
+        "type": "password",
+        "required": true,
+        "stored_in": "creds",
+        "placeholder": "eyJ...",
+        "help_text": "Create under your Profile → Long-Lived Access Tokens in Home Assistant"
+      }
+    ],
+    "validation": {
+      "available": true,
+      "description": "Calls GET /api/ to verify connectivity and the token."
+    }
+  },
+  {
+    "id": "todoist",
+    "name": "Todoist",
+    "description": "Tasks, projects, and productivity management",
+    "category": "personal",
+    "icon": "TD",
+    "icon_color": "#e44332",
+    "type": "credentials",
+    "default_label": "Todoist",
+    "multi_account": false,
+    "fields": [
+      {
+        "key": "api_key",
+        "label": "API Token",
+        "type": "password",
+        "required": true,
+        "stored_in": "creds",
+        "placeholder": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "help_text": "Found under Todoist Settings → Integrations → Developer → API token"
+      }
+    ],
+    "validation": {
+      "available": true,
+      "description": "Calls GET /rest/v2/projects to verify the API token."
+    }
   }
 ]

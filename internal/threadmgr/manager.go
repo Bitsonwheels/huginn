@@ -84,6 +84,14 @@ type ThreadManager struct {
 	// Nil-safe — no events are emitted when nil.
 	emitter *EventEmitter
 
+	// threadBus, if set, stores bounded sibling-context updates so delegated
+	// threads can consume recent updates from other subthreads in the same session.
+	threadBus *ThreadBus
+
+	// proposalRegistry stores action proposals and scoped approval tokens used
+	// by delegated threads when requesting approval for high-risk actions.
+	proposalRegistry *ProposalRegistry
+
 	// onCancelMu guards onCancel.
 	onCancelMu sync.RWMutex
 	// onCancel, if non-nil, is called after a thread transitions to
@@ -93,7 +101,7 @@ type ThreadManager struct {
 	onCancel func(sessionID, threadID string)
 
 	// statusChangeMu guards statusChangeHooks.
-	statusChangeMu   sync.RWMutex
+	statusChangeMu    sync.RWMutex
 	statusChangeHooks []func(id string, status ThreadStatus)
 
 	// backendFor, if set, resolves the correct backend for a given agent
@@ -109,6 +117,16 @@ type ThreadManager struct {
 	// toolExecutor, if set, is the gate-wrapped executor for sub-agent tool
 	// calls. Captures the permission gate at wiring time. Set via SetToolExecutor.
 	toolExecutor ToolExecutorFn
+
+	// runtimePreparer, if set, is invoked once when a thread spawns to build
+	// the agent's per-thread execution context: tool schemas (toolbelt +
+	// MuninnDB vault), gate-wrapped tool executor, persona prompt addendum,
+	// and a cleanup callback. Per-agent runtime is what gives a delegated
+	// worker its own MuninnDB tools, skills/connections-derived schemas, and
+	// memory_mode prompt — instead of inheriting only the orchestrator's
+	// global toolset. When nil the legacy toolRegistry/toolExecutor path is
+	// used. Set via SetAgentRuntimePreparer.
+	runtimePreparer AgentRuntimePreparer
 
 	// memberChecker, if set, validates that the AgentID in CreateParams is a
 	// member of the given SpaceID before creating the thread.
@@ -131,6 +149,8 @@ func New() *ThreadManager {
 		fileLocks:            make(map[string]string),
 		MaxThreadsPerSession: DefaultMaxThreadsPerSession,
 		auditLog:             make([]AuditEntry, 0, maxAuditEntries),
+		threadBus:            NewThreadBus(DefaultThreadBusCapacity),
+		proposalRegistry:     NewProposalRegistry(),
 	}
 }
 
@@ -156,6 +176,20 @@ func (tm *ThreadManager) SetEventEmitter(e *EventEmitter) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 	tm.emitter = e
+}
+
+// SetThreadBus wires the sibling context bus. Pass nil to disable.
+func (tm *ThreadManager) SetThreadBus(bus *ThreadBus) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	tm.threadBus = bus
+}
+
+// SetProposalRegistry wires the proposal/token registry. Pass nil to disable.
+func (tm *ThreadManager) SetProposalRegistry(reg *ProposalRegistry) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	tm.proposalRegistry = reg
 }
 
 // SetOnCancel registers a callback that is invoked after a thread is
@@ -187,6 +221,46 @@ type ToolRegistryIface interface {
 // gate; future interactive modes can swap in a gate that prompts the user.
 type ToolExecutorFn func(ctx context.Context, name string, args map[string]any) (string, error)
 
+// AgentRuntime is the per-thread execution context produced by an
+// AgentRuntimePreparer. It mirrors what the orchestrator builds for a primary
+// chat session — vault-aware tool schemas, a gate-wrapped tool executor that
+// dispatches against the agent's session-local registry fork, an addendum
+// appended to the persona system prompt (memory_mode + memory_block), and a
+// cleanup callback invoked when the thread completes (closes the MuninnDB
+// MCP client and tears down the toolbelt environment).
+//
+// All fields are optional. A non-nil but otherwise empty AgentRuntime is
+// equivalent to the legacy fallback path (no per-agent schemas/executor).
+type AgentRuntime struct {
+	// Schemas are the LLM tool definitions for this agent run. They replace
+	// the legacy toolRegistry-derived schemas when the runtime is non-nil,
+	// and are appended after the threadmgr-owned finish/request_help schemas.
+	Schemas []backend.Tool
+
+	// ExecuteTool dispatches a tool call against the agent's session-local
+	// tool registry (vault tools + toolbelt providers + local builtins) with
+	// the agent-specific permission gate applied. When non-nil it takes
+	// precedence over the global toolExecutor for this thread.
+	ExecuteTool ToolExecutorFn
+
+	// ExtraSystem is appended to the persona system prompt (the first system
+	// message produced by buildContext). Used to inject memory_mode
+	// instructions and the agent's memory_block when the vault is reachable.
+	ExtraSystem string
+
+	// Cleanup is invoked exactly once when the thread goroutine exits. Use
+	// it to close the per-thread MuninnDB MCP client and release any session
+	// env state. Nil-safe.
+	Cleanup func()
+}
+
+// AgentRuntimePreparer is invoked when a thread spawns to build the agent's
+// per-thread execution context. Returning (nil, nil) opts the thread out of
+// the per-agent path and falls back to the legacy global toolRegistry/
+// toolExecutor wiring. Returning a non-nil error is logged and also falls
+// back to the legacy path so that vault outages do not kill delegation.
+type AgentRuntimePreparer func(ctx context.Context, agentName string) (*AgentRuntime, error)
+
 // SetToolRegistry wires the tool registry used by sub-agent threads to obtain
 // agent-specific tool schemas (bash, read_file, etc.).
 func (tm *ThreadManager) SetToolRegistry(r ToolRegistryIface) {
@@ -202,6 +276,18 @@ func (tm *ThreadManager) SetToolExecutor(fn ToolExecutorFn) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 	tm.toolExecutor = fn
+}
+
+// SetAgentRuntimePreparer wires the function invoked once per spawned thread
+// to build the agent's per-thread execution context (vault-aware tool
+// schemas, executor, prompt addendum, cleanup). Pass nil to disable. When
+// disabled, threads use the global toolRegistry/toolExecutor and never see
+// MuninnDB tools — that legacy path is retained for tests and for agents
+// without memory enabled. Thread-safe.
+func (tm *ThreadManager) SetAgentRuntimePreparer(fn AgentRuntimePreparer) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	tm.runtimePreparer = fn
 }
 
 // SetMembershipChecker wires the SpaceMembershipChecker used to validate that
@@ -418,7 +504,7 @@ func (tm *ThreadManager) ListBySession(sessionID string) []*Thread {
 	var result []*Thread
 	for _, t := range tm.threads {
 		if t.SessionID == sessionID {
-			cp := *t   // copy the struct
+			cp := *t // copy the struct
 			result = append(result, &cp)
 		}
 	}
@@ -669,6 +755,7 @@ func (tm *ThreadManager) CleanupSession(sessionID string) {
 	tm.mu.Lock()
 	var cancels []func()
 	var orphanIDs []string
+	bus := tm.threadBus
 	for id, t := range tm.threads {
 		if t.SessionID != sessionID {
 			continue
@@ -693,6 +780,64 @@ func (tm *ThreadManager) CleanupSession(sessionID string) {
 	for _, id := range orphanIDs {
 		tm.ReleaseLeases(id)
 	}
+	if bus != nil {
+		bus.ClearSession(sessionID)
+	}
+}
+
+// PublishSiblingContext writes a short context update for a live thread. The
+// update becomes visible to sibling threads in the same session.
+func (tm *ThreadManager) PublishSiblingContext(threadID, content string) {
+	if strings.TrimSpace(content) == "" {
+		return
+	}
+	tm.mu.RLock()
+	t, ok := tm.threads[threadID]
+	bus := tm.threadBus
+	tm.mu.RUnlock()
+	if !ok || bus == nil {
+		return
+	}
+	bus.Publish(t.SessionID, ThreadContextMessage{
+		ThreadID: threadID,
+		AgentID:  t.AgentID,
+		Content:  clipResult(content, 240),
+	})
+}
+
+// SiblingContext returns recent context updates from sibling threads in the
+// same session as threadID. Updates from threadID itself are excluded.
+func (tm *ThreadManager) SiblingContext(threadID string, limit int) []ThreadContextMessage {
+	tm.mu.RLock()
+	t, ok := tm.threads[threadID]
+	bus := tm.threadBus
+	tm.mu.RUnlock()
+	if !ok || bus == nil {
+		return nil
+	}
+	return bus.SiblingContext(t.SessionID, threadID, limit)
+}
+
+// RequireApprovalToken validates a lead-issued token for a high-risk delegated
+// action within the scope of the thread's session/thread/provider/action.
+func (tm *ThreadManager) RequireApprovalToken(threadID, token, provider, action string) error {
+	tm.mu.RLock()
+	t, ok := tm.threads[threadID]
+	reg := tm.proposalRegistry
+	tm.mu.RUnlock()
+	if !ok {
+		return ErrApprovalTokenScopeMismatch
+	}
+	if reg == nil {
+		return ErrApprovalTokenRequired
+	}
+	return reg.RequireToken(token, TokenRequirement{
+		HighRisk:  true,
+		SessionID: t.SessionID,
+		ThreadID:  threadID,
+		Provider:  provider,
+		Action:    action,
+	})
 }
 
 // ErrThreadNotFound is returned by ArchiveThread when the thread ID does not exist.
