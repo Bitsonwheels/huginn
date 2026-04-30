@@ -1,3 +1,5 @@
+# [![Fork-Changes/Diffs](https://github.com/scrypster/huginn/compare/develop...Bitsonwheels:huginn:develop)]
+
 # Huginn
 
 **AI that thinks alongside you, not just when you ask.**
